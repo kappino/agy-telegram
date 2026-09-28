@@ -11,10 +11,32 @@ import html
 import json
 import logging
 import os
+import time
 from pathlib import Path
-from typing import Optional, Callable, Coroutine, Any, Dict, List
+from typing import Optional, Callable, Coroutine, Any, Dict, List, Tuple
 
 logger = logging.getLogger("agy_telegram.watcher")
+
+
+def _read_transcript_delta(transcript_path: Path, current_offset: int) -> Tuple[str, int]:
+    """Lettura sincrona del delta file eseguita in thread separato."""
+    try:
+        file_size = transcript_path.stat().st_size
+        if file_size < current_offset:
+            # File ruotato o troncato
+            current_offset = 0
+
+        if file_size == current_offset:
+            return "", current_offset
+
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(current_offset)
+            chunk = f.read()
+            new_offset = f.tell()
+            return chunk, new_offset
+    except Exception as e:
+        logger.debug(f"Errore lettura file transcript a offset {current_offset}: {e}")
+        return "", current_offset
 
 
 class TranscriptWatcher:
@@ -79,35 +101,18 @@ class TranscriptWatcher:
 
         last_status_sent = ""
         pending_buffer = ""
-        elapsed = 0.0
+        start_time = time.monotonic()
         poll_interval = 0.3
 
-        while elapsed < timeout_seconds:
+        while (time.monotonic() - start_time) < timeout_seconds:
             await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
 
             if not transcript_path.is_file():
                 continue
 
-            try:
-                file_size = transcript_path.stat().st_size
-                if file_size < current_offset:
-                    # File ruotato o troncato
-                    current_offset = 0
-                    pending_buffer = ""
-
-                if file_size == current_offset:
-                    # Nessun nuovo dato disponibile: zero allocazioni I/O
-                    continue
-
-                with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(current_offset)
-                    chunk = f.read()
-                    current_offset = f.tell()
-
-            except Exception as e:
-                logger.debug(f"Errore lettura file transcript a offset {current_offset}: {e}")
-                continue
+            chunk, current_offset = await asyncio.to_thread(
+                _read_transcript_delta, transcript_path, current_offset
+            )
 
             if not chunk:
                 continue

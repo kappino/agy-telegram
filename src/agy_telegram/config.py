@@ -82,7 +82,8 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
             Path.cwd() / ".env.telegram",
             Path.home() / ".config/agy-telegram/.env",
             Path.home() / ".env.telegram",
-            Path("/opt/aegis-agent/.env.telegram"),  # Compatibilità backward
+            Path.home() / ".agy-telegram.env",
+            Path("/etc/agy-telegram/.env"),
         ]
         for env_file in env_candidates:
             if env_file.is_file():

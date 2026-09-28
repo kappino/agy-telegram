@@ -114,8 +114,11 @@ def markdown_to_telegram_html(text: str) -> str:
     return "\n".join(processed_lines).strip()
 
 
-def split_text(text: str, max_chunk: int = 4000) -> List[str]:
-    """Divide un testo lungo su righe logiche evitando di rompere paragrafi o tag HTML."""
+def split_text(text: str, max_chunk: int = 3800) -> List[str]:
+    """
+    Divide un testo lungo su righe logiche bilanciando automaticamente tag HTML aperti
+    (<pre><code>, <blockquote>) tra chunk successivi per evitare BadRequest su Telegram.
+    """
     if len(text) <= max_chunk:
         return [text]
 
@@ -123,15 +126,45 @@ def split_text(text: str, max_chunk: int = 4000) -> List[str]:
     lines = text.split("\n")
     current_lines = []
     current_len = 0
+    in_pre = False
+    in_quote = False
+    pre_opening = "<pre><code>"
 
     for line in lines:
         line_len = len(line) + 1
 
+        # Traccia apertura/chiusura tag
+        if "<pre" in line:
+            in_pre = True
+            m = re.search(r'<pre(?: class="[^"]*")?><code>', line)
+            if m:
+                pre_opening = m.group(0)
+        if "</pre>" in line:
+            in_pre = False
+
+        if "<blockquote>" in line:
+            in_quote = True
+        if "</blockquote>" in line:
+            in_quote = False
+
         if current_len + line_len > max_chunk:
             if current_lines:
-                chunks.append("\n".join(current_lines))
+                chunk_str = "\n".join(current_lines)
+                if in_pre:
+                    chunk_str += "</code></pre>"
+                if in_quote:
+                    chunk_str += "</blockquote>"
+                chunks.append(chunk_str)
+
                 current_lines = []
                 current_len = 0
+                if in_pre:
+                    current_lines.append(pre_opening)
+                    current_len += len(pre_opening) + 1
+                if in_quote:
+                    current_lines.append("<blockquote>")
+                    current_len += len("<blockquote>") + 1
+
             if line_len > max_chunk:
                 for i in range(0, len(line), max_chunk):
                     chunks.append(line[i : i + max_chunk])
@@ -141,6 +174,7 @@ def split_text(text: str, max_chunk: int = 4000) -> List[str]:
         current_len += line_len
 
     if current_lines:
-        chunks.append("\n".join(current_lines))
+        chunk_str = "\n".join(current_lines)
+        chunks.append(chunk_str)
 
     return chunks

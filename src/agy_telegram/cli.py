@@ -45,6 +45,12 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+RuntimeDirectory=agy-telegram
+RuntimeDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

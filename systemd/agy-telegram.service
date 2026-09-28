@@ -22,9 +22,13 @@ ExecStart=/usr/local/bin/agy-telegram
 Restart=always
 RestartSec=5s
 
-# Process security options
+# Process security & sandboxing options
 NoNewPrivileges=true
-PrivateTmp=false
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+RuntimeDirectory=agy-telegram
+RuntimeDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

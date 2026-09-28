@@ -42,13 +42,17 @@ class SessionManager:
             except Exception:
                 pass
 
-        # 2. Parsing diretto da history.jsonl
+        # 2. Parsing limitato da history.jsonl (usando deque con dimensione limitata per evitare memory spikes)
         if self.history_file.is_file():
+            from collections import deque
             try:
-                with open(self.history_file, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
+                # Leggi solo le ultime righe senza allocare l'intero file in memoria
+                max_tail = max(50, limit * 10)
+                with open(self.history_file, "r", encoding="utf-8", errors="replace") as f:
+                    recent_lines = deque(f, maxlen=max_tail)
+
                 seen = set()
-                for line in reversed(lines):
+                for line in reversed(recent_lines):
                     if not line.strip():
                         continue
                     try:
@@ -56,10 +60,10 @@ class SessionManager:
                         conv_id = entry.get("conversationId")
                         if not conv_id and "id" in entry:
                             conv_id = entry["id"]
-                        
+
                         display = entry.get("display", "").strip()
                         ts = entry.get("timestamp")
-                        
+
                         if conv_id and conv_id not in seen:
                             seen.add(conv_id)
                             dt_str = ""
@@ -69,7 +73,7 @@ class SessionManager:
                                     dt_str = dt.strftime("%Y-%m-%d %H:%M")
                                 except Exception:
                                     pass
-                            
+
                             sessions.append({
                                 "id": conv_id,
                                 "preview": (display[:80] + "...") if len(display) > 80 else display,

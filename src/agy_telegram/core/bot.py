@@ -17,6 +17,7 @@ Features:
 import asyncio
 import html
 import logging
+import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -73,6 +74,7 @@ class TurnContext:
     active_prompt_cmd: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     is_completed: bool = False
+    watcher_task: Optional[asyncio.Task] = None
 
 
 class AgyTelegramBot:
@@ -96,10 +98,17 @@ class AgyTelegramBot:
         self.is_tmux_mode = (config.mirror.mode == "tmux")
         self.transcript_watcher = TranscriptWatcher()
         self.lock = asyncio.Lock()
+        self.user_locks: Dict[int, asyncio.Lock] = {}
         self.app: Optional[Application] = None
 
         # Isolamento di stato per utente / turno
         self.active_turns: Dict[int, TurnContext] = {}
+
+    def get_user_lock(self, user_id: int) -> asyncio.Lock:
+        """Restituisce il lock di serializzazione per un dato utente."""
+        if user_id not in self.user_locks:
+            self.user_locks[user_id] = asyncio.Lock()
+        return self.user_locks[user_id]
 
     def is_authorized(self, update: Update) -> bool:
         if not update.effective_user:
@@ -306,7 +315,7 @@ class AgyTelegramBot:
         if not self.is_authorized(update):
             return
 
-        sessions = self.session_mgr.list_recent_sessions(limit=6)
+        sessions = await asyncio.to_thread(self.session_mgr.list_recent_sessions, limit=6)
         if not sessions:
             await self.reply_safe(update, "ℹ️ Nessuna sessione archiviata trovata nella cronologia.")
             return
@@ -351,25 +360,47 @@ class AgyTelegramBot:
             turn_ctx.status_msg = None
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Esegue diagnostica di sistema universale o personalizzata."""
+        """Esegue diagnostica di sistema universale o personalizzata in modo sicuro."""
         if not self.is_authorized(update):
             return
         await update.effective_chat.send_action(ChatAction.TYPING)
 
-        # Se l'utente ha configurato status_command usa quello, altrimenti usa comandi POSIX universali
-        status_cmd = self.config.agent.status_command or (
-            "echo '=== Host Status & Resources ===' && "
-            "uptime && echo '' && free -h 2>/dev/null || free && "
-            "echo '' && df -h / 2>/dev/null || df -h"
-        )
+        allowed_status_binaries = {"uptime", "free", "df", "uname", "top", "systemctl", "vmstat", "iostat"}
+        custom_cmd = self.config.agent.status_command
 
-        proc = await asyncio.create_subprocess_shell(
-            status_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate()
-        out = stdout.decode("utf-8", errors="replace").strip()
+        if custom_cmd:
+            tokens = shlex.split(custom_cmd.strip())
+            bin_name = Path(tokens[0]).name if tokens else ""
+            if bin_name not in allowed_status_binaries:
+                logger.warning(f"cmd_status rifiutato: binario '{bin_name}' non è nella allowlist")
+                await self.reply_safe(
+                    update,
+                    f"⚠️ <b>Comando di status non autorizzato:</b> <code>{html.escape(bin_name)}</code>\n"
+                    f"Binari consentiti: <code>{', '.join(sorted(allowed_status_binaries))}</code>",
+                )
+                return
+            proc = await asyncio.create_subprocess_exec(
+                *tokens,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        else:
+            # Script diagnostico predefinito statico e sicuro
+            proc = await asyncio.create_subprocess_exec(
+                "sh",
+                "-c",
+                "echo '=== Host Status & Resources ===' && uptime && echo '' && free -h 2>/dev/null || free && echo '' && df -h / 2>/dev/null || df -h",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            out = stdout.decode("utf-8", errors="replace").strip()
+        except asyncio.TimeoutError:
+            proc.kill()
+            out = "⚠️ Timeout esecuzione diagnostica (superati 10 secondi)."
+
         await self.reply_safe(update, f"📊 *System Status*\n```text\n{out}\n```")
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -424,7 +455,7 @@ class AgyTelegramBot:
         latest_transcript = self.transcript_watcher.get_latest_transcript_path()
         conv_id = latest_transcript.parent.parent.name if latest_transcript else "N/D"
 
-        stats = compute_session_usage(latest_transcript, current_model)
+        stats = await asyncio.to_thread(compute_session_usage, latest_transcript, current_model)
         msg = format_usage_html(stats, conv_id, current_mode)
         await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
 
@@ -436,6 +467,15 @@ class AgyTelegramBot:
         query = update.callback_query
         await query.answer()
         if not query.data or not update.effective_user:
+            return
+
+        # Verifica autorizzazione utente sui callback
+        if not self.is_authorized(update):
+            logger.warning(f"Callback rifiutato da utente non autorizzato: {update.effective_user.id}")
+            try:
+                await query.answer("⛔ Accesso non autorizzato.", show_alert=True)
+            except Exception:
+                pass
             return
 
         user_id = update.effective_user.id
@@ -492,14 +532,30 @@ class AgyTelegramBot:
                 pass
             return
 
-        # 4. Approvazione / Rifiuto comandi
+        # 4. Approvazione / Rifiuto comandi (con validazione rigida del turn_id)
         if query.data.startswith("tmux_key:"):
             parts = query.data.split(":")
             key = parts[1]
+            target_turn_id = parts[2] if len(parts) > 2 else None
 
             turn_ctx = self.active_turns.get(user_id)
-            if turn_ctx:
-                turn_ctx.is_prompt_active = False
+
+            # Prevenzione di replay per comandi di turni precedenti o scaduti
+            if not turn_ctx or (target_turn_id and turn_ctx.turn_id != target_turn_id):
+                try:
+                    await query.edit_message_text(
+                        "⏳ <i>Questa richiesta di autorizzazione è scaduta. Il turno non è più attivo.</i>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    await query.answer("⏳ Richiesta scaduta.", show_alert=True)
+                return
+
+            if not turn_ctx.is_prompt_active:
+                await query.answer("ℹ️ Nessun comando attualmente in attesa di approvazione.", show_alert=True)
+                return
+
+            turn_ctx.is_prompt_active = False
 
             await self.tmux_mirror.send_raw_key(key)
             await self.tmux_mirror.send_raw_key("Enter")
@@ -529,193 +585,208 @@ class AgyTelegramBot:
         chat_id = update.effective_chat.id
 
         cleaned_cmd = user_text.strip()
-        if "Status" in cleaned_cmd:
-            await self.cmd_status(update, context)
-            return
-        elif "Usage" in cleaned_cmd:
-            await self.cmd_usage(update, context)
-            return
-        elif "Model" in cleaned_cmd:
-            await self.cmd_model(update, context)
-            return
-        elif "Auto-Edit" in cleaned_cmd or "Autoedit" in cleaned_cmd:
-            await self.cmd_autoedit(update, context)
-            return
-        elif "New" in cleaned_cmd:
-            await self.cmd_new(update, context)
-            return
-        elif "Sessions" in cleaned_cmd:
-            await self.cmd_sessions(update, context)
-            return
-        elif "Abort" in cleaned_cmd:
-            await self.cmd_abort(update, context)
-            return
-        elif "Help" in cleaned_cmd:
-            await self.cmd_help(update, context)
+
+        # Lookup esatto dei comandi da tastiera rapida
+        quick_action_map = {
+            "📊 Status": self.cmd_status,
+            "📈 Usage": self.cmd_usage,
+            "🤖 Model": self.cmd_model,
+            "✍️ Auto-Edit": self.cmd_autoedit,
+            "✍️ Autoedit": self.cmd_autoedit,
+            "🆕 New": self.cmd_new,
+            "🗂️ Sessions": self.cmd_sessions,
+            "🛑 Abort": self.cmd_abort,
+            "ℹ️ Help": self.cmd_help,
+        }
+
+        if cleaned_cmd in quick_action_map:
+            await quick_action_map[cleaned_cmd](update, context)
             return
 
         self.mirror_log.log("USER", user_text)
 
-        # Pulizia del turno precedente
-        prev_turn = self.active_turns.get(user_id)
-        if prev_turn and not prev_turn.is_completed:
-            prev_turn.is_completed = True
-            if prev_turn.status_msg:
-                try:
-                    await prev_turn.status_msg.delete()
-                except Exception:
-                    pass
-
-        turn_ctx = TurnContext(
-            turn_id=uuid.uuid4().hex[:8],
-            user_id=user_id,
-            chat_id=chat_id,
-        )
-        self.active_turns[user_id] = turn_ctx
-
-        if self.is_tmux_mode:
-            # Controllo esistenza della sessione Tmux
-            if not await self.tmux_mirror.check_session_exists():
-                turn_ctx.is_completed = True
-                self.active_turns.pop(user_id, None)
-                target = self.tmux_mirror.target
-                sess_name = target.split(":")[0] if ":" in target else target
-                err_msg = (
-                    f"⚠️ <b>Sessione Tmux non trovata!</b>\n\n"
-                    f"Target configurato: <code>{html.escape(target)}</code>\n\n"
-                    f"<b>Come procedere:</b>\n"
-                    f"1. Avvia una sessione tmux sul server con:\n"
-                    f"   <code>tmux new -s {html.escape(sess_name)} agy</code>\n"
-                    f"2. Oppure imposta <code>mode = 'driver'</code> nel tuo <code>config.toml</code> per eseguire senza tmux."
-                )
-                await update.effective_message.reply_text(err_msg, parse_mode=ParseMode.HTML)
-                return
-
-            latest_transcript = self.transcript_watcher.get_latest_transcript_path()
-            start_offset = 0
-            if latest_transcript and latest_transcript.is_file():
-                start_offset = self.transcript_watcher.get_current_offset(latest_transcript)
-
-            await update.effective_chat.send_action(ChatAction.TYPING)
-            await self.tmux_mirror.send_input(user_text, press_enter=True)
-
-            status_msg = await update.effective_message.reply_text(
-                "💭 <b>Elaborazione in corso...</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            turn_ctx.status_msg = status_msg
-
-            async def on_status_update(status_text: str):
-                if turn_ctx.is_completed or turn_ctx.is_prompt_active:
-                    return
-                if turn_ctx.status_msg:
+        # Serializzazione per-utente per prevenire race conditions su turni sovrapposti
+        async with self.get_user_lock(user_id):
+            # Pulizia esplicita del turno e cancellazione del watcher precedente
+            prev_turn = self.active_turns.get(user_id)
+            if prev_turn and not prev_turn.is_completed:
+                prev_turn.is_completed = True
+                if prev_turn.watcher_task and not prev_turn.watcher_task.done():
+                    prev_turn.watcher_task.cancel()
+                    logger.debug(f"Annullato watcher task orfano del turno precedente: {prev_turn.turn_id}")
+                if prev_turn.status_msg:
                     try:
-                        await turn_ctx.status_msg.edit_text(status_text, parse_mode=ParseMode.HTML)
+                        await prev_turn.status_msg.delete()
                     except Exception:
                         pass
 
-            async def on_turn_prompt(cmd_requested: str, options: List[Tuple[str, str]]):
-                if turn_ctx.is_completed:
+            turn_ctx = TurnContext(
+                turn_id=uuid.uuid4().hex[:8],
+                user_id=user_id,
+                chat_id=chat_id,
+            )
+            self.active_turns[user_id] = turn_ctx
+
+            if self.is_tmux_mode:
+                # Controllo esistenza della sessione Tmux
+                if not await self.tmux_mirror.check_session_exists():
+                    turn_ctx.is_completed = True
+                    if self.active_turns.get(user_id) == turn_ctx:
+                        self.active_turns.pop(user_id, None)
+                    target = self.tmux_mirror.target
+                    sess_name = target.split(":")[0] if ":" in target else target
+                    err_msg = (
+                        f"⚠️ <b>Sessione Tmux non trovata!</b>\n\n"
+                        f"Target configurato: <code>{html.escape(target)}</code>\n\n"
+                        f"<b>Come procedere:</b>\n"
+                        f"1. Avvia una sessione tmux sul server con:\n"
+                        f"   <code>tmux new -s {html.escape(sess_name)} agy</code>\n"
+                        f"2. Oppure imposta <code>mode = 'driver'</code> nel tuo <code>config.toml</code> per eseguire senza tmux."
+                    )
+                    await update.effective_message.reply_text(err_msg, parse_mode=ParseMode.HTML)
                     return
-                turn_ctx.is_prompt_active = True
-                turn_ctx.active_prompt_cmd = cmd_requested
 
-                buttons = [
-                    [
-                        InlineKeyboardButton("✅ Approva", callback_data=f"tmux_key:1:{turn_ctx.turn_id}"),
-                        InlineKeyboardButton("❌ Rifiuta", callback_data=f"tmux_key:4:{turn_ctx.turn_id}"),
-                    ]
-                ]
-                markup = InlineKeyboardMarkup(buttons)
-                clean_cmd = html.escape(cmd_requested)
-                prompt_html = (
-                    "⚠️ <b>Richiesta Autorizzazione Comando</b>\n"
-                    f"<pre><code class=\"language-bash\">{clean_cmd}</code></pre>"
+                latest_transcript = self.transcript_watcher.get_latest_transcript_path()
+                start_offset = 0
+                if latest_transcript and latest_transcript.is_file():
+                    start_offset = self.transcript_watcher.get_current_offset(latest_transcript)
+
+                await update.effective_chat.send_action(ChatAction.TYPING)
+                await self.tmux_mirror.send_input(user_text, press_enter=True)
+
+                status_msg = await update.effective_message.reply_text(
+                    "💭 <b>Elaborazione in corso...</b>",
+                    parse_mode=ParseMode.HTML,
                 )
+                turn_ctx.status_msg = status_msg
 
-                if turn_ctx.status_msg:
+                last_status_edit_time = 0.0
+
+                async def on_status_update(status_text: str):
+                    nonlocal last_status_edit_time
+                    if turn_ctx.is_completed or turn_ctx.is_prompt_active:
+                        return
+                    # Throttling a 1.5s per evitare rate limiting HTTP 429 di Telegram
+                    now = time.monotonic()
+                    if now - last_status_edit_time < 1.5:
+                        return
+                    if turn_ctx.status_msg:
+                        try:
+                            await turn_ctx.status_msg.edit_text(status_text, parse_mode=ParseMode.HTML)
+                            last_status_edit_time = now
+                        except Exception:
+                            pass
+
+                async def on_turn_prompt(cmd_requested: str, options: List[Tuple[str, str]]):
+                    if turn_ctx.is_completed:
+                        return
+                    turn_ctx.is_prompt_active = True
+                    turn_ctx.active_prompt_cmd = cmd_requested
+
+                    buttons = [
+                        [
+                            InlineKeyboardButton("✅ Approva", callback_data=f"tmux_key:1:{turn_ctx.turn_id}"),
+                            InlineKeyboardButton("❌ Rifiuta", callback_data=f"tmux_key:4:{turn_ctx.turn_id}"),
+                        ]
+                    ]
+                    markup = InlineKeyboardMarkup(buttons)
+                    clean_cmd = html.escape(cmd_requested)
+                    prompt_html = (
+                        "⚠️ <b>Richiesta Autorizzazione Comando</b>\n"
+                        f"<pre><code class=\"language-bash\">{clean_cmd}</code></pre>"
+                    )
+
+                    if turn_ctx.status_msg:
+                        try:
+                            await turn_ctx.status_msg.edit_text(
+                                prompt_html,
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=markup,
+                            )
+                            return
+                        except Exception:
+                            pass
+
                     try:
-                        await turn_ctx.status_msg.edit_text(
+                        new_msg = await update.effective_chat.send_message(
                             prompt_html,
                             parse_mode=ParseMode.HTML,
                             reply_markup=markup,
                         )
-                        return
-                    except Exception:
-                        pass
+                        turn_ctx.prompt_msg = new_msg
+                    except Exception as ex:
+                        logger.error(f"Errore invio prompt autorizzazione: {ex}")
 
-                try:
-                    new_msg = await update.effective_chat.send_message(
-                        prompt_html,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=markup,
-                    )
-                    turn_ctx.prompt_msg = new_msg
-                except Exception as ex:
-                    logger.error(f"Errore invio prompt autorizzazione: {ex}")
+                async def on_final_response(final_text: str):
+                    turn_ctx.is_completed = True
+                    turn_ctx.is_prompt_active = False
 
-            async def on_final_response(final_text: str):
-                turn_ctx.is_completed = True
-                turn_ctx.is_prompt_active = False
+                    await self.tmux_mirror.stop_turn_monitoring()
 
-                await self.tmux_mirror.stop_turn_monitoring()
-
-                if turn_ctx.status_msg:
-                    try:
-                        await turn_ctx.status_msg.delete()
-                    except Exception:
-                        pass
-                    turn_ctx.status_msg = None
-
-                self.mirror_log.log("AGY", final_text)
-                await self.reply_safe(update, final_text)
-                self.active_turns.pop(user_id, None)
-
-            await self.tmux_mirror.start_turn_monitoring(on_prompt=on_turn_prompt)
-
-            if latest_transcript:
-                asyncio.create_task(
-                    self.transcript_watcher.watch_turn(
-                        transcript_path=latest_transcript,
-                        start_offset=start_offset,
-                        on_status=on_status_update,
-                        on_final=on_final_response,
-                    )
-                )
-        else:
-            await update.effective_chat.send_action(ChatAction.TYPING)
-            async with self.lock:
-                stop_typing = False
-
-                async def keep_typing():
-                    while not stop_typing:
+                    if turn_ctx.status_msg:
                         try:
-                            await update.effective_chat.send_action(ChatAction.TYPING)
+                            await turn_ctx.status_msg.delete()
                         except Exception:
                             pass
-                        await asyncio.sleep(4)
+                        turn_ctx.status_msg = None
 
-                typing_task = asyncio.create_task(keep_typing())
-                try:
-                    code, stdout, stderr = await self.driver.execute_prompt(
-                        prompt=user_text,
-                        conversation_id=self.session_mgr.get_active_session(),
-                        workspace=self.config.agent.default_workspace,
-                        model=self.config.agent.default_model,
+                    self.mirror_log.log("AGY", final_text)
+                    await self.reply_safe(update, final_text)
+                    # Rimuovi solo se il turno registrato è ancora questo
+                    if self.active_turns.get(user_id) == turn_ctx:
+                        self.active_turns.pop(user_id, None)
+
+                await self.tmux_mirror.start_turn_monitoring(on_prompt=on_turn_prompt)
+
+                if latest_transcript:
+                    # Tracciamento del task con gestione eccezioni
+                    watcher_task = asyncio.create_task(
+                        self.transcript_watcher.watch_turn(
+                            transcript_path=latest_transcript,
+                            start_offset=start_offset,
+                            on_status=on_status_update,
+                            on_final=on_final_response,
+                        )
                     )
-                    stop_typing = True
-                    typing_task.cancel()
+                    watcher_task.add_done_callback(
+                        lambda t: t.exception() if not t.cancelled() and t.exception() else None
+                    )
+                    turn_ctx.watcher_task = watcher_task
+            else:
+                await update.effective_chat.send_action(ChatAction.TYPING)
+                async with self.lock:
+                    stop_typing = False
 
-                    response = stdout if stdout else (stderr or "✅ *(Nessun output)*")
-                    self.mirror_log.log("AGY", response)
-                    await self.reply_safe(update, response)
-                except Exception as e:
-                    stop_typing = True
-                    typing_task.cancel()
-                    await self.reply_safe(update, f"⚠️ Errore interno: `{e}`")
-                finally:
-                    turn_ctx.is_completed = True
-                    self.active_turns.pop(user_id, None)
+                    async def keep_typing():
+                        while not stop_typing:
+                            try:
+                                await update.effective_chat.send_action(ChatAction.TYPING)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(4)
+
+                    typing_task = asyncio.create_task(keep_typing())
+                    try:
+                        code, stdout, stderr = await self.driver.execute_prompt(
+                            prompt=user_text,
+                            conversation_id=self.session_mgr.get_active_session(),
+                            workspace=self.config.agent.default_workspace,
+                            model=self.config.agent.default_model,
+                        )
+                        stop_typing = True
+                        typing_task.cancel()
+
+                        response = stdout if stdout else (stderr or "✅ *(Nessun output)*")
+                        self.mirror_log.log("AGY", response)
+                        await self.reply_safe(update, response)
+                    except Exception as e:
+                        stop_typing = True
+                        typing_task.cancel()
+                        await self.reply_safe(update, f"⚠️ Errore interno: `{e}`")
+                    finally:
+                        turn_ctx.is_completed = True
+                        if self.active_turns.get(user_id) == turn_ctx:
+                            self.active_turns.pop(user_id, None)
 
     # -------------------------------------------------------------
     # Proactive Sentinel Alert Handler

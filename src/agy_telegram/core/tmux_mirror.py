@@ -39,88 +39,98 @@ class TmuxMirror:
         self.on_output_callback = on_output
         self.on_prompt_callback = on_prompt
 
-    async def check_session_exists(self) -> bool:
-        """Verifica se la sessione tmux target è attiva e accessibile."""
-        # Se il target contiene un indice di pannello (es. main:0.0), estrai il nome sessione
-        session_name = self.target.split(":")[0] if ":" in self.target else self.target
-        cmd = ["tmux", "has-session", "-t", session_name]
+    async def _exec_tmux(self, *args: str, timeout: float = 5.0) -> Tuple[bool, str, str]:
+        """Esegue un comando tmux con timeout rigido e gestione sicura delle eccezioni."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                "tmux",
+                *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await proc.communicate()
-            return proc.returncode == 0
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            out = stdout.decode("utf-8", errors="replace")
+            err = stderr.decode("utf-8", errors="replace")
+            return (proc.returncode == 0, out, err)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            logger.error(f"Timeout comando tmux: tmux {' '.join(args)} (superati {timeout}s)")
+            return (False, "", "timeout")
         except Exception as e:
-            logger.debug(f"Verifica sessione tmux fallita ({e})")
-            return False
+            logger.debug(f"Errore esecuzione tmux {' '.join(args)}: {e}")
+            return (False, "", str(e))
+
+    async def check_session_exists(self) -> bool:
+        """Verifica se la sessione tmux target è attiva e accessibile."""
+        session_name = self.target.split(":")[0] if ":" in self.target else self.target
+        success, _, _ = await self._exec_tmux("has-session", "-t", session_name, timeout=3.0)
+        return success
 
     async def send_input(self, text: str, press_enter: bool = True) -> bool:
-        """Inietta il testo istantaneamente tramite buffer di copia tmux (senza lag da digitazione)."""
+        """Inietta il testo istantaneamente tramite buffer di copia tmux con timeout garantito."""
         if not await self.check_session_exists():
             logger.warning(f"Sessione tmux '{self.target}' non trovata!")
             return False
 
         logger.info(f"Invio input istantaneo a tmux [{self.target}]: {text[:50]}...")
-        proc_buf = await asyncio.create_subprocess_exec("tmux", "set-buffer", "-b", "agy_input", text)
-        await proc_buf.wait()
+        ok_buf, _, _ = await self._exec_tmux("set-buffer", "-b", "agy_input", text)
+        if not ok_buf:
+            return False
 
-        proc_paste = await asyncio.create_subprocess_exec("tmux", "paste-buffer", "-b", "agy_input", "-t", self.target)
-        await proc_paste.wait()
+        ok_paste, _, _ = await self._exec_tmux("paste-buffer", "-b", "agy_input", "-t", self.target)
+        if not ok_paste:
+            return False
 
         if press_enter:
-            proc_enter = await asyncio.create_subprocess_exec("tmux", "send-keys", "-t", self.target, "Enter")
-            await proc_enter.wait()
+            ok_enter, _, _ = await self._exec_tmux("send-keys", "-t", self.target, "Enter")
+            return ok_enter
 
         return True
 
     async def send_raw_key(self, key: str) -> bool:
-        """Invia un tasto speciale (es. C-c, Enter, '1', '2')."""
+        """Invia un tasto speciale (es. C-c, Enter, '1', '4') con timeout garantito."""
         if not await self.check_session_exists():
             return False
 
-        proc = await asyncio.create_subprocess_exec("tmux", "send-keys", "-t", self.target, key)
-        await proc.wait()
-        return True
+        success, _, _ = await self._exec_tmux("send-keys", "-t", self.target, key)
+        return success
 
     async def capture_recent_lines(self, lines_count: int = 25) -> List[str]:
         """
         Cattura unicamente le ultime N righe visibili del pannello target.
-        Evita di catturare 3.000 righe e riduce drasticamente l'overhead di CPU e memoria.
+        Evita di catturare l'intera cronologia e riduce drasticamente l'overhead di CPU e memoria.
         """
-        cmd = ["tmux", "capture-pane", "-t", self.target, "-p", "-S", f"-{lines_count}"]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            if proc.returncode != 0:
-                return []
-            raw = stdout.decode("utf-8", errors="replace")
-            clean = strip_ansi(raw)
-            return clean.splitlines()
-        except Exception as e:
-            logger.debug(f"Errore cattura tmux pane: {e}")
+        success, raw, _ = await self._exec_tmux(
+            "capture-pane", "-t", self.target, "-p", "-S", f"-{lines_count}", timeout=3.0
+        )
+        if not success:
             return []
+        clean = strip_ansi(raw)
+        return clean.splitlines()
 
     def parse_permission_options(self, lines: List[str]) -> Tuple[str, List[Tuple[str, str]]]:
         """
         Analizza le righe del terminale per estrarre il comando per cui viene chiesta autorizzazione.
-        Restituisce opzioni pulite e sicure (1 = Approva, 4 = Rifiuta).
+        Supporta molteplici pattern di prompt per resilienza a variazioni di formato.
         """
         text = "\n".join(lines)
         cmd_requested = "Comando di sistema"
 
-        perm_match = re.search(r'Requesting permission for:\s*\n\s*(.*?)(?:\n\s*Run this command|\n\s*\[|\n\s*1\.)', text, re.DOTALL)
-        if perm_match:
-            cmd_requested = perm_match.group(1).strip()
-        else:
-            cmd_match = re.search(r'(?:command|execute):\s*`?([^\n`]+)`?', text, re.IGNORECASE)
-            if cmd_match:
-                cmd_requested = cmd_match.group(1).strip()
+        patterns = [
+            r'Requesting permission for:\s*\n\s*(.*?)(?:\n\s*Run this command|\n\s*\[|\n\s*1\.)',
+            r'Permission requested?:\s*\n\s*(.*?)(?:\n|$)',
+            r'Run this command\?.*?`([^`]+)`',
+            r'(?:command|execute):\s*`?([^\n`]+)`?',
+        ]
+
+        for pat in patterns:
+            m = re.search(pat, text, re.DOTALL | re.IGNORECASE)
+            if m and m.group(1).strip():
+                cmd_requested = m.group(1).strip()
+                break
 
         # In Antigravity CLI interattivo:
         # Tasto 1 = Approva (Allow once)
@@ -136,7 +146,13 @@ class TmuxMirror:
         """Verifica se il terminale è attualmente fermo su una richiesta di autorizzazione."""
         lines = await self.capture_recent_lines(lines_count=25)
         text = "\n".join(lines)
-        if "Requesting permission for:" in text or "Run this command?" in text:
+        prompt_indicators = [
+            "Requesting permission for:",
+            "Run this command?",
+            "Allow once",
+            "Do you want to run this tool?",
+        ]
+        if any(indicator in text for indicator in prompt_indicators):
             cmd, options = self.parse_permission_options(lines)
             return cmd, options
         return None

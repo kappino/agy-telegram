@@ -52,23 +52,57 @@ def get_current_model() -> str:
     return "Gemini 3.8 Flash (High)"
 
 
-def set_current_model(model_name: str) -> bool:
-    """Aggiorna il modello in settings.json (ricaricato in tempo reale dall'agente)."""
+import tempfile
+
+
+def _atomic_update_settings(key: str, value: str) -> bool:
+    """Aggiorna atomisticamente un campo in settings.json tramite file temporaneo e rename."""
     settings_path = resolve_settings_path()
     try:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         data = {}
         if settings_path.is_file():
-            with open(settings_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        data["model"] = model_name
-        with open(settings_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        logger.info(f"Modello aggiornato in {settings_path}: {model_name}")
-        return True
+            try:
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+
+        data[key] = value
+
+        # Scrittura atomica per prevenire file vuoto o corrotto in caso di crash
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=str(settings_path.parent),
+            prefix="settings_",
+            suffix=".tmp",
+            delete=False,
+            encoding="utf-8",
+        )
+        try:
+            json.dump(data, tmp, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp.close()
+            os.replace(tmp.name, str(settings_path))
+            return True
+        except Exception:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            raise
     except Exception as e:
-        logger.error(f"Errore scrittura {settings_path}: {e}")
+        logger.error(f"Errore scrittura atomica in {settings_path}: {e}")
         return False
+
+
+def set_current_model(model_name: str) -> bool:
+    """Aggiorna il modello in settings.json in modo atomico."""
+    ok = _atomic_update_settings("model", model_name)
+    if ok:
+        logger.info(f"Modello aggiornato in {resolve_settings_path()}: {model_name}")
+    return ok
 
 
 def get_current_mode() -> str:
@@ -85,19 +119,8 @@ def get_current_mode() -> str:
 
 
 def set_current_mode(mode_slug: str) -> bool:
-    """Aggiorna la modalità di esecuzione in settings.json."""
-    settings_path = resolve_settings_path()
-    try:
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {}
-        if settings_path.is_file():
-            with open(settings_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        data["mode"] = mode_slug
-        with open(settings_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        logger.info(f"Modalità aggiornata in {settings_path}: {mode_slug}")
-        return True
-    except Exception as e:
-        logger.error(f"Errore scrittura mode in {settings_path}: {e}")
-        return False
+    """Aggiorna la modalità di esecuzione in settings.json in modo atomico."""
+    ok = _atomic_update_settings("mode", mode_slug)
+    if ok:
+        logger.info(f"Modalità aggiornata in {resolve_settings_path()}: {mode_slug}")
+    return ok
