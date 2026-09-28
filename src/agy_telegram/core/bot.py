@@ -426,9 +426,11 @@ class AgyTelegramBot:
         if context.args and len(context.args) > 0:
             query_arg = " ".join(context.args).lower().strip()
             target_model = None
+            target_slug = None
             for slug, display in AVAILABLE_MODELS:
                 if query_arg in slug.lower() or query_arg in display.lower():
                     target_model = display
+                    target_slug = slug
                     break
 
             if target_model:
@@ -436,6 +438,8 @@ class AgyTelegramBot:
                 if not success:
                     await self.reply_safe(update, "❌ *Failed to update model in settings.json.*")
                     return
+                if self.is_tmux_mode and target_slug:
+                    await self.tmux_mirror.send_input(f"/model {target_slug}", press_enter=True)
                 await self.reply_safe(update, f"✅ *Model updated successfully.*\nActive: `{target_model}`")
                 return
             else:
@@ -500,6 +504,14 @@ class AgyTelegramBot:
             chosen_model = query.data.split("set_model:", 1)[1]
             success = set_current_model(chosen_model)
             if success:
+                if self.is_tmux_mode:
+                    target_slug = None
+                    for slug, display in AVAILABLE_MODELS:
+                        if display == chosen_model or slug == chosen_model:
+                            target_slug = slug
+                            break
+                    if target_slug:
+                        await self.tmux_mirror.send_input(f"/model {target_slug}", press_enter=True)
                 try:
                     await query.edit_message_text(
                         f"✅ <b>Model updated successfully</b>\n"
@@ -510,6 +522,7 @@ class AgyTelegramBot:
                 except Exception:
                     pass
                 await query.answer("Model updated.")
+
             else:
                 await query.edit_message_text("❌ <i>Failed to update model in settings.json.</i>", parse_mode=ParseMode.HTML)
                 await query.answer("Error updating model.", show_alert=True)
