@@ -1,0 +1,30 @@
+[Unit]
+Description=agy-telegram - Antigravity Telegram Gateway & Cockpit
+After=network.target
+
+[Service]
+Type=simple
+# Set the user running tmux and Antigravity CLI (change if not root)
+# User=ubuntu
+# Group=ubuntu
+# WorkingDirectory=/home/ubuntu
+
+Environment="PYTHONUNBUFFERED=1"
+# Optional: explicitly point to your config file
+# Environment="AGY_TELEGRAM_CONFIG=/home/ubuntu/.config/agy-telegram/config.toml"
+
+# ExecStart path can be adapted based on installation method:
+# System installation:
+ExecStart=/usr/local/bin/agy-telegram
+# Virtualenv installation:
+# ExecStart=/home/ubuntu/.venv/bin/agy-telegram
+
+Restart=always
+RestartSec=5s
+
+# Process security options
+NoNewPrivileges=true
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

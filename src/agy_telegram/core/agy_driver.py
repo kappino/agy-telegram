@@ -6,6 +6,8 @@ Supports streaming, timeout handling, and session resumption.
 import asyncio
 import logging
 import os
+import shutil
+from pathlib import Path
 from typing import Optional, AsyncGenerator, Tuple
 
 logger = logging.getLogger("agy_telegram.driver")
@@ -13,17 +15,32 @@ logger = logging.getLogger("agy_telegram.driver")
 class AgyDriver:
     def __init__(
         self,
-        executable: str = "/root/.local/bin/agy",
-        default_workspace: str = "/opt/aegis-agent",
+        executable: str = "agy",
+        default_workspace: str = ".",
         default_model: str = "gemini-3.8-flash",
         default_effort: str = "high",
         timeout: int = 600,
+        skip_permissions: bool = False,
     ):
-        self.executable = executable
+        resolved_exe = shutil.which(executable)
+        if not resolved_exe:
+            home = Path.home()
+            candidates = [
+                str(home / ".local" / "bin" / "agy"),
+                str(home / ".gemini" / "antigravity-cli" / "bin" / "agy"),
+                "/usr/local/bin/agy",
+                "/usr/bin/agy",
+            ]
+            for candidate in candidates:
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    resolved_exe = candidate
+                    break
+        self.executable = resolved_exe or executable
         self.default_workspace = default_workspace
         self.default_model = default_model
         self.default_effort = default_effort
         self.timeout = timeout
+        self.skip_permissions = skip_permissions
         self.current_process: Optional[asyncio.subprocess.Process] = None
 
     def abort_current_task(self) -> bool:
@@ -65,17 +82,28 @@ class AgyDriver:
         if self.default_effort:
             cmd.extend(["--effort", self.default_effort])
 
-        cmd.extend([
-            "-p", prompt,
-            "--dangerously-skip-permissions",
-        ])
+        cmd.extend(["-p", prompt])
+
+        if self.skip_permissions:
+            logger.warning("ATTENZIONE: --dangerously-skip-permissions e' attivo su richiesta esplicita di configurazione!")
+            cmd.append("--dangerously-skip-permissions")
+
+        home_dir = str(Path.home())
+        current_path = os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        antigravity_bin = str(Path.home() / ".gemini" / "antigravity-cli" / "bin")
+        local_bin = str(Path.home() / ".local" / "bin")
+        clean_path = f"{antigravity_bin}:{local_bin}:{current_path}"
 
         clean_env = {
-            "PATH": "/root/.gemini/antigravity-cli/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "HOME": os.environ.get("HOME", "/root"),
-            "USER": os.environ.get("USER", "root"),
+            "PATH": clean_path,
+            "HOME": home_dir,
+            "USER": os.environ.get("USER", Path.home().name or "user"),
             "TERM": "xterm-256color",
         }
+        for k in ["ANTIGRAVITY_HOME", "GEMINI_CLI_HOME", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]:
+            if k in os.environ:
+                clean_env[k] = os.environ[k]
+
 
         logger.info(f"Esecuzione agy in '{ws}' con modello '{mdl}'...")
         proc = await asyncio.create_subprocess_exec(

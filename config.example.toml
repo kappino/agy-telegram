@@ -1,0 +1,58 @@
+# agy-telegram configuration example
+# Copy this file to ~/.config/agy-telegram/config.toml or /etc/agy-telegram/config.toml
+
+[telegram]
+# Required: Your Telegram Bot Token obtained from @BotFather
+bot_token = "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ"
+
+# List of authorized Telegram User IDs (integers).
+# Only users listed here can interact with the bot. Messages from any other ID will be silently dropped.
+# You can discover your numeric user ID by messaging @userinfobot on Telegram.
+allowed_users = [123456789]
+
+[agent]
+# Path or command for the Antigravity CLI binary (default: "agy")
+executable = "agy"
+
+# Default workspace directory where agy commands will execute
+default_workspace = "."
+
+# Default AI model for non-interactive driver prompts
+default_model = "gemini-3.8-flash"
+
+# Default reasoning effort ("low", "medium", "high")
+default_effort = "high"
+
+# Maximum timeout in seconds for agent operations
+timeout_seconds = 600
+
+# WARNING: If set to true, skips CLI tool permission prompts in driver mode.
+# Keep false unless running in an isolated sandbox!
+skip_permissions = false
+
+# Optional shell command executed by /status (e.g., "uptime", "systemctl status myapp")
+# If omitted or null, /status displays default system stats and tmux information.
+# status_command = "uptime"
+
+[sentinel]
+# Enable UNIX domain socket sentinel for inter-process alerts and notifications
+enabled = true
+
+# Path to the UNIX domain socket
+socket_path = "/tmp/agy-sentinel.sock"
+
+[mirror]
+# Enable bidirectional terminal bridge with tmux
+enabled = true
+
+# Bridge mode: "tmux" (live bidirectional bridge) or "log" (read-only file watcher)
+mode = "tmux"
+
+# Tmux session/window/pane to attach to (e.g., "main:0.0", "dev:0", "0")
+target_session = "main:0.0"
+
+# Path to audit log file (used in log mode or as fallback audit log)
+log_file = "/tmp/agy-telegram-chat.log"
+
+# Status polling interval in seconds
+check_interval_seconds = 1.0

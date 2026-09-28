@@ -1,20 +1,21 @@
 """
-Terminal mirror logger allowing live tmux split-pane watching.
+Terminal mirror logger allowing live terminal history / split-pane logging.
 """
 
 from pathlib import Path
 from datetime import datetime
 import os
 
+
 class TerminalMirror:
-    def __init__(self, log_file: str = "/var/log/agy-telegram-chat.log"):
+    def __init__(self, log_file: str = "/tmp/agy-telegram-chat.log"):
         self.log_path = Path(log_file)
         try:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             if not self.log_path.exists():
                 self.log_path.touch(mode=0o666, exist_ok=True)
         except Exception:
-            # Fallback a directory corrente
+            # Fallback sicuro in directory temporanea utente
             self.log_path = Path("/tmp/agy-telegram-chat.log")
 
     def log(self, sender: str, text: str):

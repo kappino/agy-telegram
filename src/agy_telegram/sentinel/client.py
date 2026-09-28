@@ -10,7 +10,7 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description="Send instant push alerts to agy-telegram")
-    parser.add_argument("--title", "-t", default="Sistema Aegis", help="Notification title")
+    parser.add_argument("--title", "-t", default="Antigravity Sentinel", help="Notification title")
     parser.add_argument("--message", "-m", required=True, help="Notification message body")
     parser.add_argument("--level", "-l", choices=["info", "warning", "alert"], default="info", help="Severity level")
     parser.add_argument("--socket", "-s", default="/tmp/agy-sentinel.sock", help="Path to sentinel socket")
