@@ -4,20 +4,20 @@ After=network.target
 
 [Service]
 Type=simple
-# Set the user running tmux and Antigravity CLI (change if not root)
+# Non-privileged user running tmux and Antigravity CLI
 # User=ubuntu
 # Group=ubuntu
-# WorkingDirectory=/home/ubuntu
+WorkingDirectory=%h
+StateDirectory=agy-telegram
 
 Environment="PYTHONUNBUFFERED=1"
 # Optional: explicitly point to your config file
-# Environment="AGY_TELEGRAM_CONFIG=/home/ubuntu/.config/agy-telegram/config.toml"
+# Environment="AGY_TELEGRAM_CONFIG=%h/.config/agy-telegram/config.toml"
 
 # ExecStart path can be adapted based on installation method:
-# System installation:
-ExecStart=/usr/local/bin/agy-telegram
-# Virtualenv installation:
-# ExecStart=/home/ubuntu/.venv/bin/agy-telegram
+ExecStart=/usr/local/bin/agy-telegram start
+# Virtualenv installation example:
+# ExecStart=%h/.venv/bin/agy-telegram start
 
 Restart=always
 RestartSec=5s
@@ -27,8 +27,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
+ReadWritePaths=%h/.gemini/antigravity-cli %h/.config/agy-telegram
 RuntimeDirectory=agy-telegram
 RuntimeDirectoryMode=0700
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

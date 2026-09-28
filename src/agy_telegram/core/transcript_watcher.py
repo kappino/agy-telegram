@@ -15,11 +15,13 @@ import time
 from pathlib import Path
 from typing import Optional, Callable, Coroutine, Any, Dict, List, Tuple
 
+from agy_telegram.config import get_antigravity_home
+
 logger = logging.getLogger("agy_telegram.watcher")
 
 
 def _read_transcript_delta(transcript_path: Path, current_offset: int) -> Tuple[str, int]:
-    """Synchronous delta file read executed inside a worker thread."""
+    """Synchronous binary delta file read executed inside a worker thread."""
     try:
         file_size = transcript_path.stat().st_size
         if file_size < current_offset:
@@ -29,10 +31,11 @@ def _read_transcript_delta(transcript_path: Path, current_offset: int) -> Tuple[
         if file_size == current_offset:
             return "", current_offset
 
-        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(transcript_path, "rb") as f:
             f.seek(current_offset)
-            chunk = f.read()
+            raw_bytes = f.read()
             new_offset = f.tell()
+            chunk = raw_bytes.decode("utf-8", errors="replace")
             return chunk, new_offset
     except Exception as e:
         logger.debug(f"Error reading transcript file at offset {current_offset}: {e}")
@@ -41,7 +44,7 @@ def _read_transcript_delta(transcript_path: Path, current_offset: int) -> Tuple[
 
 class TranscriptWatcher:
     def __init__(self, brain_dir: Optional[str] = None):
-        self.brain_dir = Path(brain_dir or Path.home() / ".gemini/antigravity-cli/brain")
+        self.brain_dir = Path(brain_dir) if brain_dir else get_antigravity_home() / "brain"
 
     def get_latest_transcript_path(self, conv_id: Optional[str] = None) -> Optional[Path]:
         """Finds most recent transcript or the transcript for a specific conversation."""
@@ -59,6 +62,18 @@ class TranscriptWatcher:
             reverse=True,
         )
         return transcripts[0] if transcripts else None
+
+    async def await_latest_transcript(
+        self, conv_id: Optional[str] = None, timeout: float = 5.0
+    ) -> Optional[Path]:
+        """Polls asynchronously for up to `timeout` seconds waiting for transcript.jsonl to appear."""
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            p = self.get_latest_transcript_path(conv_id=conv_id)
+            if p and p.is_file():
+                return p
+            await asyncio.sleep(0.4)
+        return None
 
     def get_current_offset(self, transcript_path: Path) -> int:
         """Returns current file size in bytes for instant O(1) tailing."""
@@ -79,6 +94,7 @@ class TranscriptWatcher:
         """
         Streams transcript in real-time from a byte offset O(1).
         Emits status updates for reasoning and tool invocations, returning final response.
+        Raises TimeoutError if timeout_seconds is exceeded without turn completion.
         """
         current_offset = 0
 
@@ -86,9 +102,9 @@ class TranscriptWatcher:
         if start_offset is not None:
             current_offset = max(0, start_offset)
         elif start_line is not None and start_line > 0 and transcript_path.is_file():
-            # Backward-compatible fallback: scan once to offset
+            # Backward-compatible fallback: scan once to offset in binary
             try:
-                with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+                with open(transcript_path, "rb") as f:
                     for _ in range(start_line):
                         if not f.readline():
                             break
@@ -181,3 +197,6 @@ class TranscriptWatcher:
                         if on_final:
                             await on_final(content)
                         return
+
+        logger.warning(f"watch_turn timed out after {timeout_seconds}s on {transcript_path}")
+        raise asyncio.TimeoutError(f"Task execution timed out after {timeout_seconds} seconds.")

@@ -75,12 +75,22 @@ class TmuxMirror:
             logger.warning(f"tmux session '{self.target}' not found.")
             return False
 
+        # Verify target pane is not dead or sitting at a bare shell
+        ok_cmd, cmd_out, _ = await self._exec_tmux("display-message", "-p", "-t", self.target, "#{pane_current_command}")
+        running_cmd = cmd_out.strip().lower() if ok_cmd else ""
+        bare_shells = {"bash", "zsh", "sh", "fish", "csh", "tcsh", "dash"}
+        if not ok_cmd or not running_cmd or running_cmd in bare_shells:
+            logger.error(
+                f"Cannot send input: pane '{self.target}' is running a bare shell or no process ({running_cmd})"
+            )
+            return False
+
         logger.info(f"Injecting input to tmux [{self.target}]: {text[:50]}...")
-        ok_buf, _, _ = await self._exec_tmux("set-buffer", "-b", "agy_input", text)
+        ok_buf, _, _ = await self._exec_tmux("set-buffer", "-b", "agy_input", "--", text)
         if not ok_buf:
             return False
 
-        ok_paste, _, _ = await self._exec_tmux("paste-buffer", "-b", "agy_input", "-t", self.target)
+        ok_paste, _, _ = await self._exec_tmux("paste-buffer", "-p", "-d", "-b", "agy_input", "-t", self.target)
         if not ok_paste:
             return False
 
@@ -100,11 +110,11 @@ class TmuxMirror:
 
     async def capture_recent_lines(self, lines_count: int = 25) -> List[str]:
         """
-        Captures only the last N visible lines of the target pane.
+        Captures only the last N visible lines of the target pane without wrapping (-J).
         Prevents full history captures and reduces CPU/memory footprint.
         """
         success, raw, _ = await self._exec_tmux(
-            "capture-pane", "-t", self.target, "-p", "-S", f"-{lines_count}", timeout=3.0
+            "capture-pane", "-t", self.target, "-p", "-J", "-S", f"-{lines_count}", timeout=3.0
         )
         if not success:
             return []
@@ -114,33 +124,66 @@ class TmuxMirror:
     def parse_permission_options(self, lines: List[str]) -> Tuple[str, List[Tuple[str, str]]]:
         """
         Extracts requested tool/command from terminal lines requiring confirmation.
-        Supports multiple prompt formats for resilience.
+        Searches backward from the most recent lines to avoid stale prompts.
+        Fail-closed: if regex cannot identify the command, returns raw terminal context
+        and disables Approve button (allows only Reject).
         """
-        text = "\n".join(lines)
-        cmd_requested = "System Command"
+        prompt_indicators = [
+            "Requesting permission for:",
+            "Run this command?",
+            "Allow once",
+            "Do you want to run this tool?",
+        ]
+
+        # Search backward for the most recent prompt indicator
+        prompt_idx = -1
+        for idx in range(len(lines) - 1, -1, -1):
+            if any(ind in lines[idx] for ind in prompt_indicators):
+                prompt_idx = idx
+                break
+
+        relevant_lines = lines
+        if prompt_idx != -1:
+            start_idx = max(0, prompt_idx - 6)
+            end_idx = min(len(lines), prompt_idx + 8)
+            relevant_lines = lines[start_idx:end_idx]
+
+        recent_text = "\n".join(relevant_lines)
 
         patterns = [
-            r'Requesting permission for:\s*\n\s*(.*?)(?:\n\s*Run this command|\n\s*\[|\n\s*1\.)',
+            r'Requesting permission for:\s*\n\s*(.*?)(?:\n\s*Run this command|\n\s*\[|\n\s*1\.|\n\s*$)',
             r'Permission requested?:\s*\n\s*(.*?)(?:\n|$)',
             r'Run this command\?.*?`([^`]+)`',
             r'(?:command|execute):\s*`?([^\n`]+)`?',
         ]
 
+        cmd_requested = None
         for pat in patterns:
-            m = re.search(pat, text, re.DOTALL | re.IGNORECASE)
+            m = re.search(pat, recent_text, re.DOTALL | re.IGNORECASE)
             if m and m.group(1).strip():
-                cmd_requested = m.group(1).strip()
-                break
+                candidate = m.group(1).strip()
+                if not candidate.startswith("1.") and not candidate.startswith("[1]"):
+                    cmd_requested = candidate
+                    break
 
-        # Antigravity CLI interactive options:
-        # Key 1 = Allow once (Approve)
-        # Key 4 = Deny (Reject)
-        options = [
-            ("1", "Approve"),
-            ("4", "Reject"),
-        ]
-
-        return cmd_requested, options
+        if cmd_requested:
+            # Deterministic, safe interactive options:
+            # Key 1 = Allow once (Approve)
+            # Key 4 = Deny (Reject)
+            options = [
+                ("1", "Approve"),
+                ("4", "Reject"),
+            ]
+            return cmd_requested, options
+        else:
+            # Fail-closed: command is ambiguous or unparsed
+            # Return raw terminal block and allow only Reject
+            raw_context = "\n".join(relevant_lines).strip()
+            raw_desc = raw_context if raw_context else "Unrecognized permission prompt"
+            options = [
+                ("4", "Reject"),
+            ]
+            return raw_desc, options
 
     async def check_for_prompt(self) -> Optional[Tuple[str, List[Tuple[str, str]]]]:
         """Checks whether terminal is currently halted on a permission request."""

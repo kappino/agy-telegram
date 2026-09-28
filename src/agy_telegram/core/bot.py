@@ -111,6 +111,11 @@ class AgyTelegramBot:
         return self.user_locks[user_id]
 
     def is_authorized(self, update: Update) -> bool:
+        if not update.effective_chat or update.effective_chat.type != "private":
+            logger.warning(
+                f"Interaction rejected: non-private chat type '{getattr(update.effective_chat, 'type', None)}'"
+            )
+            return False
         if not update.effective_user:
             return False
         user_id = update.effective_user.id
@@ -119,8 +124,8 @@ class AgyTelegramBot:
             return False
         return True
 
-    async def reply_safe(self, update: Update, text: str, reply_markup=None):
-        html_text = markdown_to_telegram_html(text)
+    async def reply_safe(self, update: Update, text: str, reply_markup=None, is_html: bool = False):
+        html_text = text if is_html else markdown_to_telegram_html(text)
         chunks = split_text(html_text)
         for i, chunk in enumerate(chunks):
             markup = reply_markup if i == len(chunks) - 1 else None
@@ -227,6 +232,8 @@ class AgyTelegramBot:
         if turn_ctx:
             turn_ctx.is_completed = True
             turn_ctx.is_prompt_active = False
+            if turn_ctx.watcher_task and not turn_ctx.watcher_task.done():
+                turn_ctx.watcher_task.cancel()
             if turn_ctx.status_msg:
                 try:
                     await turn_ctx.status_msg.delete()
@@ -234,11 +241,10 @@ class AgyTelegramBot:
                     pass
             self.active_turns.pop(user_id, None)
 
+        self.session_mgr.set_active_session(None)
         if self.is_tmux_mode:
             await self.tmux_mirror.stop_turn_monitoring()
             await self.tmux_mirror.send_input("/new", press_enter=True)
-        else:
-            self.session_mgr.set_active_session(None)
 
         msg = (
             "🆕 <b>New Session Initialized</b>\n\n"
@@ -254,7 +260,10 @@ class AgyTelegramBot:
 
         current = get_current_mode()
         new_mode = "default" if current == "accept-edits" else "accept-edits"
-        set_current_mode(new_mode)
+        success = set_current_mode(new_mode)
+        if not success:
+            await self.reply_safe(update, "❌ *Failed to update mode in settings.json.*")
+            return
 
         if self.is_tmux_mode:
             await self.tmux_mirror.send_input(f"/mode {new_mode}", press_enter=True)
@@ -283,7 +292,10 @@ class AgyTelegramBot:
             target = context.args[0].lower().strip()
             valid_slugs = [slug for slug, _, _ in AVAILABLE_MODES]
             if target in valid_slugs:
-                set_current_mode(target)
+                success = set_current_mode(target)
+                if not success:
+                    await self.reply_safe(update, "❌ *Failed to update mode in settings.json.*")
+                    return
                 if self.is_tmux_mode:
                     await self.tmux_mirror.send_input(f"/mode {target}", press_enter=True)
                 await self.reply_safe(update, f"✅ *Mode set to:* `{target}`")
@@ -342,6 +354,14 @@ class AgyTelegramBot:
         if turn_ctx:
             turn_ctx.is_completed = True
             turn_ctx.is_prompt_active = False
+            if turn_ctx.watcher_task and not turn_ctx.watcher_task.done():
+                turn_ctx.watcher_task.cancel()
+            if turn_ctx.status_msg:
+                try:
+                    await turn_ctx.status_msg.delete()
+                except Exception:
+                    pass
+            self.active_turns.pop(user_id, None)
 
         if self.is_tmux_mode:
             await self.tmux_mirror.stop_turn_monitoring()
@@ -350,13 +370,6 @@ class AgyTelegramBot:
         else:
             self.driver.abort_current_task()
             await self.reply_safe(update, "🛑 Interrupt signal sent to agent.")
-
-        if turn_ctx and turn_ctx.status_msg:
-            try:
-                await turn_ctx.status_msg.delete()
-            except Exception:
-                pass
-            turn_ctx.status_msg = None
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Executes safe universal or custom host diagnostics."""
@@ -376,6 +389,7 @@ class AgyTelegramBot:
                     update,
                     f"⚠️ <b>Unauthorized status binary:</b> <code>{html.escape(bin_name)}</code>\n"
                     f"Allowed binaries: <code>{', '.join(sorted(allowed_status_binaries))}</code>",
+                    is_html=True,
                 )
                 return
             proc = await asyncio.create_subprocess_exec(
@@ -418,7 +432,10 @@ class AgyTelegramBot:
                     break
 
             if target_model:
-                set_current_model(target_model)
+                success = set_current_model(target_model)
+                if not success:
+                    await self.reply_safe(update, "❌ *Failed to update model in settings.json.*")
+                    return
                 await self.reply_safe(update, f"✅ *Model updated successfully.*\nActive: `{target_model}`")
                 return
             else:
@@ -464,8 +481,7 @@ class AgyTelegramBot:
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        await query.answer()
-        if not query.data or not update.effective_user:
+        if not query or not query.data or not update.effective_user:
             return
 
         # Enforce callback authorization
@@ -493,8 +509,10 @@ class AgyTelegramBot:
                     )
                 except Exception:
                     pass
+                await query.answer("Model updated.")
             else:
-                await query.edit_message_text("❌ <i>Failed to update model.</i>", parse_mode=ParseMode.HTML)
+                await query.edit_message_text("❌ <i>Failed to update model in settings.json.</i>", parse_mode=ParseMode.HTML)
+                await query.answer("Error updating model.", show_alert=True)
             return
 
         # 2. Mode Selection (Auto-Edit, Default, Plan)
@@ -511,17 +529,18 @@ class AgyTelegramBot:
                     )
                 except Exception:
                     pass
+                await query.answer("Mode updated.")
             else:
-                await query.edit_message_text("❌ <i>Failed to update mode.</i>", parse_mode=ParseMode.HTML)
+                await query.edit_message_text("❌ <i>Failed to update mode in settings.json.</i>", parse_mode=ParseMode.HTML)
+                await query.answer("Error updating mode.", show_alert=True)
             return
 
         # 3. Resume Session
         if query.data.startswith("resume:"):
             conv_id = query.data.split(":", 1)[1]
+            self.session_mgr.set_active_session(conv_id)
             if self.is_tmux_mode:
                 await self.tmux_mirror.send_input(f"/resume {conv_id}", press_enter=True)
-            else:
-                self.session_mgr.set_active_session(conv_id)
             try:
                 await query.edit_message_text(
                     f"✅ <b>Session resumed:</b> <code>{html.escape(conv_id)}</code>",
@@ -529,6 +548,7 @@ class AgyTelegramBot:
                 )
             except Exception:
                 pass
+            await query.answer("Session resumed.")
             return
 
         # 4. Command Approval / Rejection (with turn_id validation)
@@ -547,7 +567,8 @@ class AgyTelegramBot:
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception:
-                    await query.answer("⏳ Request expired.", show_alert=True)
+                    pass
+                await query.answer("⏳ Request expired.", show_alert=True)
                 return
 
             if not turn_ctx.is_prompt_active:
@@ -567,6 +588,7 @@ class AgyTelegramBot:
                 )
             except Exception:
                 pass
+            await query.answer(f"Command {action_name}.")
 
     # -------------------------------------------------------------
     # Conversational Message Handler
@@ -606,8 +628,17 @@ class AgyTelegramBot:
 
         # Per-user serialization to prevent race conditions on overlapping turns
         async with self.get_user_lock(user_id):
-            # Explicit cleanup of previous turn and orphan watcher cancellation
             prev_turn = self.active_turns.get(user_id)
+            if prev_turn and prev_turn.is_prompt_active:
+                await update.effective_message.reply_text(
+                    "⚠️ <b>Pending Authorization Request</b>\n\n"
+                    "A command is currently awaiting your explicit approval or rejection.\n"
+                    "Please tap <b>Approve</b> or <b>Reject</b> above (or send <code>/abort</code>) before sending new instructions.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+            # Explicit cleanup of previous turn and orphan watcher cancellation
             if prev_turn and not prev_turn.is_completed:
                 prev_turn.is_completed = True
                 if prev_turn.watcher_task and not prev_turn.watcher_task.done():
@@ -645,7 +676,26 @@ class AgyTelegramBot:
                     await update.effective_message.reply_text(err_msg, parse_mode=ParseMode.HTML)
                     return
 
-                latest_transcript = self.transcript_watcher.get_latest_transcript_path()
+                active_conv = self.session_mgr.get_active_session()
+                latest_transcript = self.transcript_watcher.get_latest_transcript_path(conv_id=active_conv)
+                if not latest_transcript:
+                    latest_transcript = await self.transcript_watcher.await_latest_transcript(
+                        conv_id=active_conv, timeout=5.0
+                    )
+
+                if not latest_transcript:
+                    turn_ctx.is_completed = True
+                    await self.tmux_mirror.stop_turn_monitoring()
+                    if self.active_turns.get(user_id) == turn_ctx:
+                        self.active_turns.pop(user_id, None)
+                    await update.effective_message.reply_text(
+                        "⚠️ <b>Transcript log not found</b>\n\n"
+                        "Unable to locate the active Antigravity session transcript after 5 seconds.\n"
+                        "Ensure `agy` is running in your tmux session.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+
                 start_offset = 0
                 if latest_transcript and latest_transcript.is_file():
                     start_offset = self.transcript_watcher.get_current_offset(latest_transcript)
@@ -684,8 +734,8 @@ class AgyTelegramBot:
 
                     buttons = [
                         [
-                            InlineKeyboardButton("✅ Approve", callback_data=f"tmux_key:1:{turn_ctx.turn_id}"),
-                            InlineKeyboardButton("❌ Reject", callback_data=f"tmux_key:4:{turn_ctx.turn_id}"),
+                            InlineKeyboardButton(opt_label, callback_data=f"tmux_key:{opt_key}:{turn_ctx.turn_id}")
+                            for opt_key, opt_label in options
                         ]
                     ]
                     markup = InlineKeyboardMarkup(buttons)
@@ -737,20 +787,53 @@ class AgyTelegramBot:
 
                 await self.tmux_mirror.start_turn_monitoring(on_prompt=on_turn_prompt)
 
-                if latest_transcript:
-                    # Task tracking with exception handling
-                    watcher_task = asyncio.create_task(
-                        self.transcript_watcher.watch_turn(
+                async def run_turn_watcher():
+                    try:
+                        await self.transcript_watcher.watch_turn(
                             transcript_path=latest_transcript,
                             start_offset=start_offset,
                             on_status=on_status_update,
                             on_final=on_final_response,
+                            timeout_seconds=self.config.agent.timeout_seconds,
                         )
-                    )
-                    watcher_task.add_done_callback(
-                        lambda t: t.exception() if not t.cancelled() and t.exception() else None
-                    )
-                    turn_ctx.watcher_task = watcher_task
+                    except asyncio.CancelledError:
+                        pass
+                    except asyncio.TimeoutError:
+                        if not turn_ctx.is_completed:
+                            turn_ctx.is_completed = True
+                            await self.tmux_mirror.stop_turn_monitoring()
+                            if turn_ctx.status_msg:
+                                try:
+                                    await turn_ctx.status_msg.delete()
+                                except Exception:
+                                    pass
+                                turn_ctx.status_msg = None
+                            if self.active_turns.get(user_id) == turn_ctx:
+                                self.active_turns.pop(user_id, None)
+                            await update.effective_message.reply_text(
+                                f"⏱️ <b>Task Timed Out</b>\n\nExecution exceeded {self.config.agent.timeout_seconds}s limit.",
+                                parse_mode=ParseMode.HTML,
+                            )
+                    except Exception as exc:
+                        logger.error("Critical error in watcher task: %s", exc, exc_info=True)
+                        if not turn_ctx.is_completed:
+                            turn_ctx.is_completed = True
+                            await self.tmux_mirror.stop_turn_monitoring()
+                            if turn_ctx.status_msg:
+                                try:
+                                    await turn_ctx.status_msg.delete()
+                                except Exception:
+                                    pass
+                                turn_ctx.status_msg = None
+                            if self.active_turns.get(user_id) == turn_ctx:
+                                self.active_turns.pop(user_id, None)
+                            await update.effective_message.reply_text(
+                                f"⚠️ <b>Error in background watcher:</b> <code>{html.escape(str(exc))}</code>",
+                                parse_mode=ParseMode.HTML,
+                            )
+
+                watcher_task = asyncio.create_task(run_turn_watcher())
+                turn_ctx.watcher_task = watcher_task
             else:
                 await update.effective_chat.send_action(ChatAction.TYPING)
                 async with self.lock:
@@ -824,7 +907,12 @@ class AgyTelegramBot:
         self.app.add_handler(CommandHandler("status", self.cmd_status))
 
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
-        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.app.add_handler(
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE,
+                self.handle_message,
+            )
+        )
 
         if self.config.sentinel.enabled:
             self.sentinel.register_callback(self.handle_sentinel_alert)

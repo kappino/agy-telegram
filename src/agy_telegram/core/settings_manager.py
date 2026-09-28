@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from typing import Optional, List, Tuple
 
+from agy_telegram.config import get_antigravity_home
+
 logger = logging.getLogger("agy_telegram.settings")
 
 AVAILABLE_MODELS: List[Tuple[str, str]] = [
@@ -30,13 +32,7 @@ AVAILABLE_MODES: List[Tuple[str, str, str]] = [
 
 def resolve_settings_path() -> Path:
     """Resolves the path to settings.json respecting environment variable overrides."""
-    env_home = os.getenv("ANTIGRAVITY_HOME") or os.getenv("GEMINI_CLI_HOME")
-    if env_home:
-        base = Path(env_home)
-    else:
-        base = Path.home() / ".gemini/antigravity-cli"
-
-    return base / "settings.json"
+    return get_antigravity_home() / "settings.json"
 
 
 def get_current_model() -> str:
@@ -60,13 +56,26 @@ def _atomic_update_settings(key: str, value: str) -> bool:
     settings_path = resolve_settings_path()
     try:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
+        original_stat = None
         data = {}
         if settings_path.is_file():
+            original_stat = settings_path.stat()
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
+                    content = f.read()
+                if content.strip():
+                    data = json.loads(content)
+            except Exception as json_err:
+                bak_path = settings_path.with_suffix(".json.bak")
+                try:
+                    import shutil
+                    shutil.copy2(settings_path, bak_path)
+                    logger.error(f"Corrupted settings.json detected! Backed up to {bak_path}")
+                except Exception as bak_err:
+                    logger.error(f"Failed to create backup {bak_path}: {bak_err}")
+                raise ValueError(
+                    f"Corrupted settings.json at {settings_path}: {json_err}. Refusing to overwrite."
+                )
 
         data[key] = value
 
@@ -84,6 +93,18 @@ def _atomic_update_settings(key: str, value: str) -> bool:
             tmp.flush()
             os.fsync(tmp.fileno())
             tmp.close()
+
+            if original_stat:
+                try:
+                    os.chmod(tmp.name, original_stat.st_mode & 0o777)
+                except Exception:
+                    pass
+                if hasattr(os, "chown") and os.getuid() == 0:
+                    try:
+                        os.chown(tmp.name, original_stat.st_uid, original_stat.st_gid)
+                    except Exception:
+                        pass
+
             os.replace(tmp.name, str(settings_path))
             return True
         except Exception:
@@ -92,6 +113,8 @@ def _atomic_update_settings(key: str, value: str) -> bool:
             except OSError:
                 pass
             raise
+    except ValueError:
+        raise
     except Exception as e:
         logger.error(f"Atomic write error on {settings_path}: {e}")
         return False
@@ -99,7 +122,11 @@ def _atomic_update_settings(key: str, value: str) -> bool:
 
 def set_current_model(model_name: str) -> bool:
     """Updates the active model in settings.json atomically."""
-    ok = _atomic_update_settings("model", model_name)
+    try:
+        ok = _atomic_update_settings("model", model_name)
+    except Exception as e:
+        logger.error(f"Failed to update model: {e}")
+        return False
     if ok:
         logger.info(f"Updated model in {resolve_settings_path()}: {model_name}")
     return ok
@@ -120,7 +147,12 @@ def get_current_mode() -> str:
 
 def set_current_mode(mode_slug: str) -> bool:
     """Updates execution mode in settings.json atomically."""
-    ok = _atomic_update_settings("mode", mode_slug)
+    try:
+        ok = _atomic_update_settings("mode", mode_slug)
+    except Exception as e:
+        logger.error(f"Failed to update mode: {e}")
+        return False
     if ok:
         logger.info(f"Updated mode in {resolve_settings_path()}: {mode_slug}")
     return ok
+

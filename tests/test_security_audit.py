@@ -10,10 +10,23 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from agy_telegram.config import AppConfig, TelegramConfig, AgentConfig, SentinelConfig, MirrorConfig
+from agy_telegram.config import (
+    AppConfig,
+    TelegramConfig,
+    AgentConfig,
+    SentinelConfig,
+    MirrorConfig,
+    load_config,
+)
 from agy_telegram.core.bot import AgyTelegramBot, TurnContext
 from agy_telegram.core.formatter import split_text
-from agy_telegram.core.settings_manager import set_current_model, get_current_model, set_current_mode, get_current_mode
+from agy_telegram.core.settings_manager import (
+    set_current_model,
+    get_current_model,
+    set_current_mode,
+    get_current_mode,
+    _atomic_update_settings,
+)
 from agy_telegram.sentinel.server import SentinelServer
 
 
@@ -33,6 +46,7 @@ class TestSecurityAudit(unittest.TestCase):
 
         mock_update = MagicMock()
         mock_update.effective_user.id = 99999  # Unauthorized
+        mock_update.effective_chat.type = "private"
         mock_query = MagicMock()
         mock_query.data = "tmux_key:1:turn123"
         mock_query.answer = AsyncMock()
@@ -48,6 +62,24 @@ class TestSecurityAudit(unittest.TestCase):
         # Must respond with denial alert
         self.assertTrue(mock_query.answer.called)
         self.assertIn("Access denied", mock_query.answer.call_args[0][0])
+
+    def test_non_private_chat_rejected(self):
+        """Verify that any interaction from group or channel is rejected."""
+        bot = AgyTelegramBot(make_dummy_config(allowed_user_id=12345))
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 12345
+        mock_update.effective_chat.type = "group"
+        self.assertFalse(bot.is_authorized(mock_update))
+
+        mock_update.effective_chat.type = "channel"
+        self.assertFalse(bot.is_authorized(mock_update))
+
+        mock_update.effective_chat.type = "supergroup"
+        self.assertFalse(bot.is_authorized(mock_update))
+
+        mock_update.effective_chat.type = "private"
+        self.assertTrue(bot.is_authorized(mock_update))
 
     def test_stale_turn_callback_invalidation(self):
         """Verify that inline buttons from previous turns are invalidated."""
@@ -65,6 +97,7 @@ class TestSecurityAudit(unittest.TestCase):
 
         mock_update = MagicMock()
         mock_update.effective_user.id = 12345
+        mock_update.effective_chat.type = "private"
         mock_query = MagicMock()
         # Callback from a previous turn ("old_id" != "current_id")
         mock_query.data = "tmux_key:1:old_id"
@@ -95,6 +128,7 @@ class TestSecurityAudit(unittest.TestCase):
         mock_update = MagicMock()
         mock_update.effective_user.id = 12345
         mock_update.effective_chat.id = 12345
+        mock_update.effective_chat.type = "private"
         mock_update.effective_message.reply_text = AsyncMock()
         mock_update.effective_chat.send_action = AsyncMock()
 
@@ -109,6 +143,33 @@ class TestSecurityAudit(unittest.TestCase):
         self.assertTrue(bot.tmux_mirror.send_input.called)
         self.assertEqual(bot.tmux_mirror.send_input.call_args[0][0], "What is the New feature in Python 3.12?")
 
+    def test_pending_prompt_blocks_free_text_input(self):
+        """Verify that pending confirmation prompt prevents sending plain text to console."""
+        bot = AgyTelegramBot(make_dummy_config(allowed_user_id=12345))
+        bot.tmux_mirror.send_input = AsyncMock()
+
+        turn_ctx = TurnContext(
+            turn_id="turn_active",
+            user_id=12345,
+            chat_id=12345,
+            is_prompt_active=True,
+        )
+        bot.active_turns[12345] = turn_ctx
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 12345
+        mock_update.effective_chat.id = 12345
+        mock_update.effective_chat.type = "private"
+        mock_update.effective_message.text = "ls -la"
+        mock_update.effective_message.reply_text = AsyncMock()
+
+        asyncio.run(bot.handle_message(mock_update, MagicMock()))
+
+        # send_input must NOT have been called while prompt is active!
+        self.assertFalse(bot.tmux_mirror.send_input.called)
+        self.assertTrue(mock_update.effective_message.reply_text.called)
+        self.assertIn("Pending Authorization Request", mock_update.effective_message.reply_text.call_args[0][0])
+
     def test_cmd_status_allowlist_enforcement(self):
         """Verify that cmd_status rejects binaries outside the allowlist."""
         # Config with unauthorized command
@@ -118,6 +179,7 @@ class TestSecurityAudit(unittest.TestCase):
 
         mock_update = MagicMock()
         mock_update.effective_user.id = 12345
+        mock_update.effective_chat.type = "private"
         mock_update.effective_chat.send_action = AsyncMock()
 
         asyncio.run(bot.cmd_status(mock_update, MagicMock()))
@@ -143,6 +205,21 @@ class TestSecurityAudit(unittest.TestCase):
                 await server.stop()
 
             asyncio.run(run_server())
+
+    def test_sentinel_socket_occupied_refuses_to_steal(self):
+        """Verify that starting SentinelServer raises an error if another instance is listening."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = os.path.join(tmpdir, "test-sentinel-busy.sock")
+            server1 = SentinelServer(socket_path=sock_path)
+            server2 = SentinelServer(socket_path=sock_path)
+
+            async def run_test():
+                await server1.start()
+                with self.assertRaises(RuntimeError):
+                    await server2.start()
+                await server1.stop()
+
+            asyncio.run(run_test())
 
     def test_split_text_balanced_html(self):
         """Verify that split_text balances pre/code tags across consecutive chunks."""
@@ -177,6 +254,41 @@ class TestSecurityAudit(unittest.TestCase):
                 self.assertEqual(data["model"], "Claude Sonnet 4.6 (Thinking)")
                 self.assertEqual(data["mode"], "accept-edits")
 
+    def test_atomic_settings_corrupted_backup(self):
+        """Verify that corrupted settings.json triggers backup and raises error instead of overwrite."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_settings = Path(tmpdir) / "settings.json"
+            test_settings.write_text("{ this is corrupted invalid json :", encoding="utf-8")
+
+            with patch("agy_telegram.core.settings_manager.resolve_settings_path", return_value=test_settings):
+                with self.assertRaises(ValueError):
+                    _atomic_update_settings("model", "TestModel")
+
+                bak_path = Path(tmpdir) / "settings.json.bak"
+                self.assertTrue(bak_path.is_file(), "Backup file settings.json.bak must be created!")
+                self.assertEqual(bak_path.read_text(encoding="utf-8"), "{ this is corrupted invalid json :")
+
+    def test_load_config_nonexistent_file_raises_filenotfound(self):
+        """Verify that load_config raises FileNotFoundError when explicitly given non-existent path."""
+        from agy_telegram.config import load_config
+        with self.assertRaises(FileNotFoundError):
+            load_config(config_path="/tmp/non_existent_agy_config_file_12345.toml")
+
+    def test_load_config_empty_allowed_users_raises_valueerror(self):
+        """Verify that load_config raises ValueError if allowed_users is empty."""
+        from agy_telegram.config import load_config
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.toml"
+            cfg_file.write_text(
+                '[telegram]\nbot_token = "dummy:token"\nallowed_users = []\n',
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ValueError) as ctx:
+                    load_config(config_path=cfg_file)
+                self.assertIn("allowed_users", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
+

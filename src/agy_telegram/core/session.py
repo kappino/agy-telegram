@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
+from agy_telegram.config import get_antigravity_home
+
 class SessionManager:
     def __init__(self, data_dir: Optional[str] = None):
-        self.data_dir = Path(data_dir or Path.home() / ".gemini/antigravity-cli")
+        self.data_dir = Path(data_dir) if data_dir else get_antigravity_home()
         self.history_file = self.data_dir / "history.jsonl"
         self.db_file = self.data_dir / "conversation_summaries.db"
         self.current_conversation_id: Optional[str] = None

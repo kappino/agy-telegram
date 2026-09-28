@@ -14,6 +14,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
 )
+# Silence HTTP client request logs to avoid leaking bot tokens in stdout/journald
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
 logger = logging.getLogger("agy_telegram.cli")
 
 def main():
@@ -37,8 +41,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/var/lib/agy-telegram
+# Non-privileged user service
+# User=%i
+WorkingDirectory=%h
+StateDirectory=agy-telegram
 ExecStart=/usr/local/bin/agy-telegram start
 Restart=always
 RestartSec=5
@@ -49,11 +55,12 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
+ReadWritePaths=%h/.gemini/antigravity-cli %h/.config/agy-telegram
 RuntimeDirectory=agy-telegram
 RuntimeDirectoryMode=0700
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 """
         if args.action == "generate":
             print(unit_content)

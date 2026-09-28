@@ -28,6 +28,37 @@ class TestTmuxMirror(unittest.TestCase):
         self.assertEqual(options[1][0], "4")
         self.assertIn("Reject", options[1][1])
 
+    def test_parse_permission_options_fail_closed(self):
+        # Prompt without a recognizable command line
+        sample_lines = [
+            "Some ambiguous prompt:",
+            "Run this command?",
+        ]
+        cmd, options = self.mirror.parse_permission_options(sample_lines)
+        # Fail-closed: only Reject is available, Approve is disabled
+        self.assertEqual(len(options), 1)
+        self.assertEqual(options[0][0], "4")
+        self.assertEqual(options[0][1], "Reject")
+
+    def test_parse_permission_options_backward_search(self):
+        # Buffer has old stale prompt at the top and a new prompt at the bottom
+        sample_lines = [
+            "Requesting permission for:",
+            "  old_command_stale",
+            "Run this command?",
+            "Some intermediate output 1",
+            "Some intermediate output 2",
+            "Requesting permission for:",
+            "  new_command_fresh",
+            "Run this command?",
+        ]
+        cmd, options = self.mirror.parse_permission_options(sample_lines)
+        self.assertEqual(cmd, "new_command_fresh")
+        self.assertEqual(len(options), 2)
+        self.assertEqual(options[0][0], "1")
+        self.assertEqual(options[1][0], "4")
+
 
 if __name__ == "__main__":
     unittest.main()
+
