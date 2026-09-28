@@ -10,7 +10,7 @@ from agy_telegram.core.agy_driver import AgyDriver
 class TestAgyDriverSecurity(unittest.TestCase):
     def test_default_skip_permissions_is_false(self):
         driver = AgyDriver()
-        self.assertFalse(driver.skip_permissions, "Per default skip_permissions deve essere FALSE per sicurezza!")
+        self.assertFalse(driver.skip_permissions, "By default skip_permissions must be FALSE for security!")
 
     @patch("asyncio.create_subprocess_exec")
     def test_execute_prompt_omits_skip_permissions_by_default(self, mock_exec):
@@ -25,7 +25,7 @@ class TestAgyDriverSecurity(unittest.TestCase):
 
         self.assertTrue(mock_exec.called)
         called_args = mock_exec.call_args[0]
-        self.assertNotIn("--dangerously-skip-permissions", called_args, "Non deve mai essere presente --dangerously-skip-permissions senza autorizzazione esplicita!")
+        self.assertNotIn("--dangerously-skip-permissions", called_args, "--dangerously-skip-permissions must never be present without explicit authorization!")
 
     @patch("asyncio.create_subprocess_exec")
     def test_execute_prompt_includes_skip_permissions_when_explicit(self, mock_exec):

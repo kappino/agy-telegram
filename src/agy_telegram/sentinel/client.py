@@ -29,12 +29,12 @@ def main():
         client.sendall(json.dumps(payload).encode("utf-8"))
         res = client.recv(1024)
         client.close()
-        print("✅ Notifica inviata a Telegram con successo!")
+        print("Notification sent to Telegram successfully.")
     except FileNotFoundError:
-        print(f"❌ Socket non trovato in {args.socket}. Assicurati che agy-telegram sia attivo!", file=sys.stderr)
+        print(f"Socket not found at {args.socket}. Ensure agy-telegram daemon is running.", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"❌ Errore durante l'invio della notifica: {e}", file=sys.stderr)
+        print(f"Error sending notification: {e}", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":

@@ -60,8 +60,8 @@ WantedBy=multi-user.target
         elif args.action == "install":
             target = Path("/etc/systemd/system/agy-telegram.service")
             target.write_text(unit_content, encoding="utf-8")
-            print(f"✅ File di servizio installato in {target}")
-            print("Per attivare:")
+            print(f"Service unit installed to {target}")
+            print("To enable and start:")
             print("  systemctl daemon-reload")
             print("  systemctl enable --now agy-telegram")
         return
@@ -70,14 +70,14 @@ WantedBy=multi-user.target
     try:
         config = load_config(args.config if hasattr(args, "config") else None)
     except Exception as e:
-        logger.error(f"Errore caricamento configurazione: {e}")
+        logger.error(f"Failed to load configuration: {e}")
         sys.exit(1)
 
     bot = AgyTelegramBot(config)
     try:
         asyncio.run(bot.run())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Chiusura agy-telegram completata.")
+        logger.info("agy-telegram shutdown completed.")
 
 if __name__ == "__main__":
     main()

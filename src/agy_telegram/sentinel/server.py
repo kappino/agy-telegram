@@ -23,7 +23,7 @@ class SentinelServer:
         self.notification_callback = cb
 
     async def start(self):
-        """Avvia l'ascolto sul socket Unix locale con permessi restrittivi."""
+        """Starts listening on local Unix domain socket with restricted permissions."""
         sock_p = Path(self.socket_path)
         sock_p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -37,17 +37,17 @@ class SentinelServer:
             self._handle_client,
             path=self.socket_path,
         )
-        # Permessi restrittivi: solo il proprietario del processo (0600)
+        # Enforce restricted permissions (owner-only 0600)
         try:
             os.chmod(self.socket_path, 0o600)
         except OSError as e:
-            logger.warning(f"Impossibile impostare chmod 0600 su {self.socket_path}: {e}")
+            logger.warning(f"Failed to set chmod 0600 on {self.socket_path}: {e}")
 
-        logger.info(f"Sentinel IPC Server attivo su: {self.socket_path} (mode=0600)")
+        logger.info(f"Sentinel IPC Server active at {self.socket_path} (mode=0600)")
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
-            # Validazione credenziali peer (SO_PEERCRED su Linux) per prevenire spoofing locale
+            # Validate peer credentials (SO_PEERCRED on Linux) to prevent local spoofing
             sock = writer.get_extra_info("socket")
             if sock and hasattr(socket, "SO_PEERCRED"):
                 try:
@@ -58,23 +58,23 @@ class SentinelServer:
                     )
                     pid, uid, gid = struct.unpack("iII", creds)
                     expected_uid = os.getuid()
-                    # Consenti solo lo stesso UID o root (se il server non è già root)
+                    # Allow only same UID or root
                     if uid != expected_uid and uid != 0:
                         logger.warning(
-                            f"Rifiutata connessione IPC Sentinel non autorizzata: client UID={uid}, atteso={expected_uid}"
+                            f"Rejected unauthorized Sentinel IPC connection: client UID={uid}, expected={expected_uid}"
                         )
                         writer.close()
                         await writer.wait_closed()
                         return
                 except Exception as ex:
-                    logger.warning(f"Impossibile verificare SO_PEERCRED sul client: {ex}")
+                    logger.warning(f"Unable to verify SO_PEERCRED on client: {ex}")
 
             data = await reader.read(4096)
             if not data:
                 return
 
             payload = json.loads(data.decode("utf-8"))
-            logger.info(f"Notifica proattiva ricevuta: {payload.get('title')}")
+            logger.info(f"Proactive notification received: {payload.get('title')}")
 
             if self.notification_callback:
                 await self.notification_callback(payload)
@@ -82,7 +82,7 @@ class SentinelServer:
             writer.write(b'{"status": "delivered"}\n')
             await writer.drain()
         except Exception as e:
-            logger.error(f"Errore gestione client Sentinel: {e}")
+            logger.error(f"Error handling Sentinel client: {e}")
         finally:
             writer.close()
             try:

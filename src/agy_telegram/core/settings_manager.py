@@ -22,14 +22,14 @@ AVAILABLE_MODELS: List[Tuple[str, str]] = [
 ]
 
 AVAILABLE_MODES: List[Tuple[str, str, str]] = [
-    ("accept-edits", "✍️ Auto-Edit (accept-edits)", "Modifiche file auto-approvate, prompt solo per comandi shell."),
-    ("default", "🛡️ Standard (default)", "Chiede conferma per comandi e modifiche ai file."),
-    ("plan", "📋 Plan Only (plan)", "Sola pianificazione e analisi, nessuna modifica applicata."),
+    ("accept-edits", "Auto-Edit (accept-edits)", "Auto-approve file changes, prompt only for shell commands."),
+    ("default", "Standard (default)", "Requires confirmation for both commands and file changes."),
+    ("plan", "Plan Only (plan)", "Planning and research only; no changes executed."),
 ]
 
 
 def resolve_settings_path() -> Path:
-    """Risolve dinamicamente il percorso di settings.json rispettando le variabili d'ambiente."""
+    """Resolves the path to settings.json respecting environment variable overrides."""
     env_home = os.getenv("ANTIGRAVITY_HOME") or os.getenv("GEMINI_CLI_HOME")
     if env_home:
         base = Path(env_home)
@@ -40,7 +40,7 @@ def resolve_settings_path() -> Path:
 
 
 def get_current_model() -> str:
-    """Legge il modello attualmente configurato in settings.json."""
+    """Reads the active model configured in settings.json."""
     settings_path = resolve_settings_path()
     if settings_path.is_file():
         try:
@@ -48,7 +48,7 @@ def get_current_model() -> str:
                 data = json.load(f)
             return data.get("model", "Gemini 3.8 Flash (High)")
         except Exception as e:
-            logger.debug(f"Impossibile leggere il modello da {settings_path}: {e}")
+            logger.debug(f"Failed to read model from {settings_path}: {e}")
     return "Gemini 3.8 Flash (High)"
 
 
@@ -56,7 +56,7 @@ import tempfile
 
 
 def _atomic_update_settings(key: str, value: str) -> bool:
-    """Aggiorna atomisticamente un campo in settings.json tramite file temporaneo e rename."""
+    """Atomically updates a field in settings.json using a temp file and replace."""
     settings_path = resolve_settings_path()
     try:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,7 +70,7 @@ def _atomic_update_settings(key: str, value: str) -> bool:
 
         data[key] = value
 
-        # Scrittura atomica per prevenire file vuoto o corrotto in caso di crash
+        # Atomic write prevents empty/corrupted file on sudden crash
         tmp = tempfile.NamedTemporaryFile(
             mode="w",
             dir=str(settings_path.parent),
@@ -93,20 +93,20 @@ def _atomic_update_settings(key: str, value: str) -> bool:
                 pass
             raise
     except Exception as e:
-        logger.error(f"Errore scrittura atomica in {settings_path}: {e}")
+        logger.error(f"Atomic write error on {settings_path}: {e}")
         return False
 
 
 def set_current_model(model_name: str) -> bool:
-    """Aggiorna il modello in settings.json in modo atomico."""
+    """Updates the active model in settings.json atomically."""
     ok = _atomic_update_settings("model", model_name)
     if ok:
-        logger.info(f"Modello aggiornato in {resolve_settings_path()}: {model_name}")
+        logger.info(f"Updated model in {resolve_settings_path()}: {model_name}")
     return ok
 
 
 def get_current_mode() -> str:
-    """Legge la modalità di esecuzione (default, accept-edits, plan)."""
+    """Reads execution mode (default, accept-edits, plan)."""
     settings_path = resolve_settings_path()
     if settings_path.is_file():
         try:
@@ -119,8 +119,8 @@ def get_current_mode() -> str:
 
 
 def set_current_mode(mode_slug: str) -> bool:
-    """Aggiorna la modalità di esecuzione in settings.json in modo atomico."""
+    """Updates execution mode in settings.json atomically."""
     ok = _atomic_update_settings("mode", mode_slug)
     if ok:
-        logger.info(f"Modalità aggiornata in {resolve_settings_path()}: {mode_slug}")
+        logger.info(f"Updated mode in {resolve_settings_path()}: {mode_slug}")
     return ok

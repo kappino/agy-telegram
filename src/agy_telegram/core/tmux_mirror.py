@@ -17,7 +17,7 @@ ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 
 def strip_ansi(text: str) -> str:
-    """Rimuove codici di escape ANSI / VT100."""
+    """Strips ANSI and VT100 escape codes."""
     return ANSI_ESCAPE.sub('', text)
 
 
@@ -40,7 +40,7 @@ class TmuxMirror:
         self.on_prompt_callback = on_prompt
 
     async def _exec_tmux(self, *args: str, timeout: float = 5.0) -> Tuple[bool, str, str]:
-        """Esegue un comando tmux con timeout rigido e gestione sicura delle eccezioni."""
+        """Executes a tmux command with rigid timeout and safe exception handling."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 "tmux",
@@ -57,25 +57,25 @@ class TmuxMirror:
                 proc.kill()
             except Exception:
                 pass
-            logger.error(f"Timeout comando tmux: tmux {' '.join(args)} (superati {timeout}s)")
+            logger.error(f"tmux command timed out: tmux {' '.join(args)} (exceeded {timeout}s)")
             return (False, "", "timeout")
         except Exception as e:
-            logger.debug(f"Errore esecuzione tmux {' '.join(args)}: {e}")
+            logger.debug(f"Error running tmux {' '.join(args)}: {e}")
             return (False, "", str(e))
 
     async def check_session_exists(self) -> bool:
-        """Verifica se la sessione tmux target è attiva e accessibile."""
+        """Verifies if the target tmux session is alive and accessible."""
         session_name = self.target.split(":")[0] if ":" in self.target else self.target
         success, _, _ = await self._exec_tmux("has-session", "-t", session_name, timeout=3.0)
         return success
 
     async def send_input(self, text: str, press_enter: bool = True) -> bool:
-        """Inietta il testo istantaneamente tramite buffer di copia tmux con timeout garantito."""
+        """Injects text instantaneously using tmux copy buffer with timeout guarantees."""
         if not await self.check_session_exists():
-            logger.warning(f"Sessione tmux '{self.target}' non trovata!")
+            logger.warning(f"tmux session '{self.target}' not found.")
             return False
 
-        logger.info(f"Invio input istantaneo a tmux [{self.target}]: {text[:50]}...")
+        logger.info(f"Injecting input to tmux [{self.target}]: {text[:50]}...")
         ok_buf, _, _ = await self._exec_tmux("set-buffer", "-b", "agy_input", text)
         if not ok_buf:
             return False
@@ -91,7 +91,7 @@ class TmuxMirror:
         return True
 
     async def send_raw_key(self, key: str) -> bool:
-        """Invia un tasto speciale (es. C-c, Enter, '1', '4') con timeout garantito."""
+        """Sends a single key or shortcut (e.g. C-c, Enter, '1', '4') with timeout."""
         if not await self.check_session_exists():
             return False
 
@@ -100,8 +100,8 @@ class TmuxMirror:
 
     async def capture_recent_lines(self, lines_count: int = 25) -> List[str]:
         """
-        Cattura unicamente le ultime N righe visibili del pannello target.
-        Evita di catturare l'intera cronologia e riduce drasticamente l'overhead di CPU e memoria.
+        Captures only the last N visible lines of the target pane.
+        Prevents full history captures and reduces CPU/memory footprint.
         """
         success, raw, _ = await self._exec_tmux(
             "capture-pane", "-t", self.target, "-p", "-S", f"-{lines_count}", timeout=3.0
@@ -113,11 +113,11 @@ class TmuxMirror:
 
     def parse_permission_options(self, lines: List[str]) -> Tuple[str, List[Tuple[str, str]]]:
         """
-        Analizza le righe del terminale per estrarre il comando per cui viene chiesta autorizzazione.
-        Supporta molteplici pattern di prompt per resilienza a variazioni di formato.
+        Extracts requested tool/command from terminal lines requiring confirmation.
+        Supports multiple prompt formats for resilience.
         """
         text = "\n".join(lines)
-        cmd_requested = "Comando di sistema"
+        cmd_requested = "System Command"
 
         patterns = [
             r'Requesting permission for:\s*\n\s*(.*?)(?:\n\s*Run this command|\n\s*\[|\n\s*1\.)',
@@ -132,18 +132,18 @@ class TmuxMirror:
                 cmd_requested = m.group(1).strip()
                 break
 
-        # In Antigravity CLI interattivo:
-        # Tasto 1 = Approva (Allow once)
-        # Tasto 4 = Rifiuta (Deny)
+        # Antigravity CLI interactive options:
+        # Key 1 = Allow once (Approve)
+        # Key 4 = Deny (Reject)
         options = [
-            ("1", "✅ Approva"),
-            ("4", "❌ Rifiuta"),
+            ("1", "Approve"),
+            ("4", "Reject"),
         ]
 
         return cmd_requested, options
 
     async def check_for_prompt(self) -> Optional[Tuple[str, List[Tuple[str, str]]]]:
-        """Verifica se il terminale è attualmente fermo su una richiesta di autorizzazione."""
+        """Checks whether terminal is currently halted on a permission request."""
         lines = await self.capture_recent_lines(lines_count=25)
         text = "\n".join(lines)
         prompt_indicators = [
@@ -162,8 +162,8 @@ class TmuxMirror:
         on_prompt: Callable[[str, List[Tuple[str, str]]], Coroutine[Any, Any, None]],
     ):
         """
-        Avvia il monitoraggio delle autorizzazioni SOLO per la durata del turno attivo.
-        Si arresta non appena il turno è completato.
+        Starts permission prompt monitoring ONLY for the duration of the active turn.
+        Stops as soon as the turn concludes.
         """
         self.running = True
         self.last_prompt_signature = ""
@@ -178,19 +178,19 @@ class TmuxMirror:
                         sig = f"{cmd}:{[opt[0] for opt in options]}"
                         if sig != self.last_prompt_signature:
                             self.last_prompt_signature = sig
-                            logger.info(f"Richiesta autorizzazione intercettata: {cmd}")
+                            logger.info(f"Permission prompt intercepted: {cmd}")
                             await on_prompt(cmd, options)
                     else:
                         self.last_prompt_signature = ""
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger.debug(f"Eccezione durante turn monitoring: {e}")
+                    logger.debug(f"Exception in turn monitoring: {e}")
 
         self.monitor_task = asyncio.create_task(_turn_loop())
 
     async def stop_turn_monitoring(self):
-        """Arresta immediatamente il monitoraggio del turno, rilasciando la CPU."""
+        """Stops turn monitoring immediately, releasing CPU."""
         self.running = False
         if self.monitor_task:
             self.monitor_task.cancel()
@@ -201,10 +201,8 @@ class TmuxMirror:
             self.monitor_task = None
         self.last_prompt_signature = ""
 
-    # Metodi di compatibilità con la vecchia interfaccia
     async def start_monitor(self):
-        """Modalità dormiente: non effettua polling a vuoto h24."""
-        logger.info(f"TmuxMirror inizializzato per target {self.target} (modalità event-driven attiva).")
+        logger.info(f"TmuxMirror initialized for target {self.target} (event-driven mode).")
 
     async def stop_monitor(self):
         await self.stop_turn_monitoring()

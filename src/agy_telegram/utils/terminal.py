@@ -15,11 +15,11 @@ class TerminalMirror:
             if not self.log_path.exists():
                 self.log_path.touch(mode=0o666, exist_ok=True)
         except Exception:
-            # Fallback sicuro in directory temporanea utente
+            # Fallback to default user temp path
             self.log_path = Path("/tmp/agy-telegram-chat.log")
 
     def log(self, sender: str, text: str):
-        """Accoda l'evento nel file di log per visualizzazione live."""
+        """Appends the event to the chat log file."""
         now = datetime.now().strftime("%H:%M:%S")
         entry = f"[{now}] [{sender.upper()}]: {text}\n"
         try:

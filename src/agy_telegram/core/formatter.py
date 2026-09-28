@@ -116,8 +116,8 @@ def markdown_to_telegram_html(text: str) -> str:
 
 def split_text(text: str, max_chunk: int = 3800) -> List[str]:
     """
-    Divide un testo lungo su righe logiche bilanciando automaticamente tag HTML aperti
-    (<pre><code>, <blockquote>) tra chunk successivi per evitare BadRequest su Telegram.
+    Splits long text across logical lines while balancing open HTML tags
+    (<pre><code>, <blockquote>) across chunk boundaries to avoid Telegram BadRequest.
     """
     if len(text) <= max_chunk:
         return [text]

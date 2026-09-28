@@ -44,14 +44,14 @@ class AgyDriver:
         self.current_process: Optional[asyncio.subprocess.Process] = None
 
     def abort_current_task(self) -> bool:
-        """Interrompe il processo corrente inviando SIGINT/SIGKILL."""
+        """Interrupts current process by sending SIGTERM/SIGKILL."""
         if self.current_process and self.current_process.returncode is None:
             try:
                 self.current_process.terminate()
-                logger.info("Processo agy interrotto su richiesta utente.")
+                logger.info("agy process terminated on user request.")
                 return True
             except Exception as e:
-                logger.error(f"Errore durante l'interruzione di agy: {e}")
+                logger.error(f"Error terminating agy process: {e}")
                 try:
                     self.current_process.kill()
                     return True
@@ -66,7 +66,7 @@ class AgyDriver:
         workspace: Optional[str] = None,
         model: Optional[str] = None,
     ) -> Tuple[int, str, str]:
-        """Esegue un prompt verso agy e restituisce returncode, stdout e stderr."""
+        """Executes a prompt via the agy binary and returns (returncode, stdout, stderr)."""
         ws = workspace or self.default_workspace
         mdl = model or self.default_model
 
@@ -74,7 +74,7 @@ class AgyDriver:
         if conversation_id:
             cmd.extend(["--conversation", conversation_id])
         else:
-            # Continua la più recente
+            # Continue most recent session
             cmd.append("-c")
 
         if mdl:
@@ -85,7 +85,7 @@ class AgyDriver:
         cmd.extend(["-p", prompt])
 
         if self.skip_permissions:
-            logger.warning("ATTENZIONE: --dangerously-skip-permissions e' attivo su richiesta esplicita di configurazione!")
+            logger.warning("WARNING: --dangerously-skip-permissions is enabled via configuration.")
             cmd.append("--dangerously-skip-permissions")
 
         home_dir = str(Path.home())
@@ -104,8 +104,7 @@ class AgyDriver:
             if k in os.environ:
                 clean_env[k] = os.environ[k]
 
-
-        logger.info(f"Esecuzione agy in '{ws}' con modello '{mdl}'...")
+        logger.info(f"Executing agy in '{ws}' with model '{mdl}'...")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -127,7 +126,7 @@ class AgyDriver:
             )
         except asyncio.TimeoutError:
             proc.kill()
-            logger.error("Timeout esecuzione agy superato!")
-            return (-1, "", "Timeout operazione (superati 600 secondi)")
+            logger.error("agy execution timed out.")
+            return (-1, "", f"Operation timed out (exceeded {self.timeout}s)")
         finally:
             self.current_process = None

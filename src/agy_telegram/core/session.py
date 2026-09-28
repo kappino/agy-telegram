@@ -16,37 +16,34 @@ class SessionManager:
         self.current_conversation_id: Optional[str] = None
 
     def set_active_session(self, conv_id: Optional[str]):
-        """Imposta l'ID di conversazione attiva (None = nuova sessione)."""
+        """Sets active conversation ID (None = new clean session)."""
         self.current_conversation_id = conv_id
 
     def get_active_session(self) -> Optional[str]:
         return self.current_conversation_id
 
     def list_recent_sessions(self, limit: int = 8) -> List[Dict[str, Any]]:
-        """Elenca le sessioni recenti estraendo metadata e riassunto."""
+        """Lists recent sessions by extracting metadata and summary."""
         sessions = []
-        
-        # 1. Prova prima dal DB sqlite delle sintesi se disponibile
+
+        # 1. Query SQLite summary database if present
         if self.db_file.is_file():
             try:
                 conn = sqlite3.connect(f"file:{self.db_file}?mode=ro", uri=True)
                 cur = conn.cursor()
-                # Trova schema tabelle
                 cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
                 tables = [r[0] for r in cur.fetchall()]
                 if "summaries" in tables or "conversations" in tables:
                     table_name = "summaries" if "summaries" in tables else "conversations"
                     cur.execute(f"SELECT * FROM {table_name} LIMIT ?", (limit,))
-                    # se disponibile estrai i record
                 conn.close()
             except Exception:
                 pass
 
-        # 2. Parsing limitato da history.jsonl (usando deque con dimensione limitata per evitare memory spikes)
+        # 2. Bounded tail parsing from history.jsonl
         if self.history_file.is_file():
             from collections import deque
             try:
-                # Leggi solo le ultime righe senza allocare l'intero file in memoria
                 max_tail = max(50, limit * 10)
                 with open(self.history_file, "r", encoding="utf-8", errors="replace") as f:
                     recent_lines = deque(f, maxlen=max_tail)

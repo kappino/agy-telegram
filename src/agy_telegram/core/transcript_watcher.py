@@ -19,11 +19,11 @@ logger = logging.getLogger("agy_telegram.watcher")
 
 
 def _read_transcript_delta(transcript_path: Path, current_offset: int) -> Tuple[str, int]:
-    """Lettura sincrona del delta file eseguita in thread separato."""
+    """Synchronous delta file read executed inside a worker thread."""
     try:
         file_size = transcript_path.stat().st_size
         if file_size < current_offset:
-            # File ruotato o troncato
+            # File rotated or truncated
             current_offset = 0
 
         if file_size == current_offset:
@@ -35,7 +35,7 @@ def _read_transcript_delta(transcript_path: Path, current_offset: int) -> Tuple[
             new_offset = f.tell()
             return chunk, new_offset
     except Exception as e:
-        logger.debug(f"Errore lettura file transcript a offset {current_offset}: {e}")
+        logger.debug(f"Error reading transcript file at offset {current_offset}: {e}")
         return "", current_offset
 
 
@@ -44,7 +44,7 @@ class TranscriptWatcher:
         self.brain_dir = Path(brain_dir or Path.home() / ".gemini/antigravity-cli/brain")
 
     def get_latest_transcript_path(self, conv_id: Optional[str] = None) -> Optional[Path]:
-        """Trova il transcript più recente o quello specifico di una conversazione."""
+        """Finds most recent transcript or the transcript for a specific conversation."""
         if conv_id:
             path = self.brain_dir / conv_id / ".system_generated/logs/transcript.jsonl"
             if path.is_file():
@@ -61,7 +61,7 @@ class TranscriptWatcher:
         return transcripts[0] if transcripts else None
 
     def get_current_offset(self, transcript_path: Path) -> int:
-        """Restituisce la dimensione corrente del file in byte per tailing istantaneo O(1)."""
+        """Returns current file size in bytes for instant O(1) tailing."""
         try:
             return transcript_path.stat().st_size
         except Exception:
@@ -77,16 +77,16 @@ class TranscriptWatcher:
         timeout_seconds: int = 300,
     ):
         """
-        Segue in tempo reale il transcript a partire da un offset di byte (O(1)).
-        Emette aggiornamenti di stato per ragionamento e tool, e restituisce la risposta finale.
+        Streams transcript in real-time from a byte offset O(1).
+        Emits status updates for reasoning and tool invocations, returning final response.
         """
         current_offset = 0
 
-        # Calcola l'offset di partenza
+        # Calculate initial seek offset
         if start_offset is not None:
             current_offset = max(0, start_offset)
         elif start_line is not None and start_line > 0 and transcript_path.is_file():
-            # Fallback backward-compatible: calcola l'offset una sola volta
+            # Backward-compatible fallback: scan once to offset
             try:
                 with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
                     for _ in range(start_line):
@@ -94,7 +94,7 @@ class TranscriptWatcher:
                             break
                     current_offset = f.tell()
             except Exception as e:
-                logger.warning(f"Impossibile posizionare offset da start_line {start_line}: {e}")
+                logger.warning(f"Failed to seek from start_line {start_line}: {e}")
                 current_offset = 0
         elif transcript_path.is_file():
             current_offset = self.get_current_offset(transcript_path)
@@ -119,7 +119,7 @@ class TranscriptWatcher:
 
             pending_buffer += chunk
             raw_lines = pending_buffer.split("\n")
-            # L'ultimo elemento può essere una riga incompleta (non ancora terminata con \n)
+            # Last element may be an incomplete line
             pending_buffer = raw_lines.pop()
 
             for line in raw_lines:
@@ -138,7 +138,7 @@ class TranscriptWatcher:
                 thinking = record.get("thinking")
 
                 if rec_type == "PLANNER_RESPONSE":
-                    # 1. Azione di Tool in corso
+                    # 1. In-progress Tool Action
                     if tool_calls:
                         for tc in tool_calls:
                             name = tc.get("name", "tool")
@@ -163,21 +163,21 @@ class TranscriptWatcher:
                                 target = Path(args["AbsolutePath"]).name
                                 detail = f"\n📄 <code>{html.escape(target)}</code>"
 
-                            status_text = f"⚡ <b>Azione:</b> {action}{detail}"
+                            status_text = f"⚡ <b>Action:</b> {action}{detail}"
                             if status_text != last_status_sent and on_status:
                                 last_status_sent = status_text
                                 await on_status(status_text)
 
-                    # 2. Fase di Ragionamento
+                    # 2. Reasoning Phase
                     elif thinking and not content:
-                        status_text = "🧠 <b>Ragionamento in corso...</b>"
+                        status_text = "🧠 <b>Thinking...</b>"
                         if status_text != last_status_sent and on_status:
                             last_status_sent = status_text
                             await on_status(status_text)
 
-                    # 3. Risposta Finale (SOLO se NON ci sono tool calls associati a questo step!)
+                    # 3. Final Response (only when no concurrent tool calls exist)
                     elif content and not tool_calls:
-                        logger.info(f"Ricevuta risposta finale ({len(content)} caratteri).")
+                        logger.info(f"Received final response ({len(content)} characters).")
                         if on_final:
                             await on_final(content)
                         return

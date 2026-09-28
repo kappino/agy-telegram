@@ -24,9 +24,9 @@ class TestTmuxMirror(unittest.TestCase):
         self.assertEqual(cmd, "systemctl restart nginx")
         self.assertEqual(len(options), 2)
         self.assertEqual(options[0][0], "1")
-        self.assertIn("Approva", options[0][1])
+        self.assertIn("Approve", options[0][1])
         self.assertEqual(options[1][0], "4")
-        self.assertIn("Rifiuta", options[1][1])
+        self.assertIn("Reject", options[1][1])
 
 
 if __name__ == "__main__":

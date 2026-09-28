@@ -5,53 +5,53 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Bridge bidirezionale tra Telegram e la CLI di Google Antigravity (`agy`). Consente di interagire con l'agente locale tramite una sessione `tmux` attiva, approvare o rifiutare comandi via bottoni inline e ricevere notifiche proattive da script locali.
+A bidirectional Telegram bridge for the Google Antigravity (`agy`) CLI. It connects to an active `tmux` session, allows remote command approval via inline keyboards, tracks agent turns in real time, and exposes a local Unix domain socket for system push notifications.
 
 ---
 
-## Architettura
+## Architecture
 
 ```mermaid
 flowchart LR
     subgraph Client
-        TG[Telegram Mobile / Desktop]
+        TG["Telegram Mobile / Desktop"]
     end
 
     subgraph Host
-        BOT[agy-telegram daemon]
-        TMUX[tmux session: main:0.0]
-        AGY[Antigravity CLI]
-        LOG[transcript.jsonl]
-        SOCK[(/tmp/agy-sentinel.sock)]
+        BOT["agy-telegram daemon"]
+        TMUX["tmux session (main:0.0)"]
+        AGY["Antigravity CLI"]
+        LOG["transcript.jsonl"]
+        SOCK["/tmp/agy-sentinel.sock"]
     end
 
-    TG <-->|HTTPS Long Polling| BOT
-    BOT <-->|tmux buffer paste / send-keys| TMUX
-    TMUX <--> AGY
-    AGY -->|Event stream| LOG
-    LOG -->|Byte-offset tail O(1)| BOT
-    SOCK -->|IPC Unix Socket mode 0600| BOT
+    TG <--> BOT
+    BOT -->|"send-keys / paste-buffer"| TMUX
+    TMUX --> AGY
+    AGY -->|"Event stream"| LOG
+    LOG -->|"Byte-offset tail"| BOT
+    SOCK -->|"IPC Alerts (0600)"| BOT
 ```
 
-### Principi di Progettazione
-- **Zero porte in ascolto esterno**: Comunicazione solo via HTTPS long polling in uscita verso le API Telegram.
-- **Autorizzazione rigida**: Filtro sugli ID utente Telegram ammessi su tutti i messaggi e callback inline.
-- **Input istantaneo via Tmux Buffer**: I comandi lunghi vengono iniettati tramite `set-buffer` e `paste-buffer`, evitando la digitazione simulata tasto per tasto.
-- **Tailing O(1)**: Il monitoraggio dei passaggi dell'agente legge i delta del file `transcript.jsonl` tracciando l'offset in byte, senza rileggere l'intero file.
-- **IPC Locale Sicuro**: Socket UNIX locale `/tmp/agy-sentinel.sock` con permessi `0600` e verifica delle credenziali kernel (`SO_PEERCRED`) per prevenire spoofing o privilege escalation.
+### Design Principles
+- **Zero Inbound Ports**: Operates exclusively through outbound HTTPS long-polling to the Telegram Bot API.
+- **Strict Authorization**: Enforces user ID whitelisting across all text messages and inline query callbacks.
+- **Instant Buffer Injection**: Uses `tmux set-buffer` and `paste-buffer` to paste large inputs atomically, avoiding character-by-character key lag.
+- **O(1) Turn Tailing**: Watches `transcript.jsonl` using persistent byte-offset seeking, reading only new appended records without full file scans.
+- **Hardened Local IPC**: Listens on a local Unix domain socket (`/tmp/agy-sentinel.sock`) with `0600` permissions and Linux peer credential validation (`SO_PEERCRED`) to prevent local spoofing.
 
 ---
 
-## Requisiti
+## Requirements
 
 - Python 3.10+
-- Linux (supporto per systemd), macOS o WSL2
-- `tmux` installato e disponibile nel `PATH`
-- Google Antigravity CLI (`agy`) configurato sul sistema
+- Linux (with systemd), macOS, or WSL2
+- `tmux` installed and available in `$PATH`
+- Google Antigravity CLI (`agy`) configured and accessible in `$PATH`
 
 ---
 
-## Installazione
+## Installation
 
 ```bash
 git clone https://github.com/kappino/agy-telegram.git
@@ -59,27 +59,27 @@ cd agy-telegram
 pip install -e .
 ```
 
-Il pacchetto fornisce due comandi eseguibili:
-- `agy-telegram`: Demone principale per la gestione del bridge Telegram.
-- `agy-notify`: Utility CLI per inviare notifiche push via socket locale.
+This installs two executable commands:
+- `agy-telegram`: Main daemon and management CLI.
+- `agy-notify`: Command-line tool to dispatch proactive alerts through the local IPC socket.
 
 ---
 
-## Configurazione
+## Configuration
 
-Crea la directory di configurazione e copia il file di esempio:
+Create the configuration directory and copy the template:
 
 ```bash
 mkdir -p ~/.config/agy-telegram
 cp config.example.toml ~/.config/agy-telegram/config.toml
 ```
 
-Configura `~/.config/agy-telegram/config.toml`:
+Edit `~/.config/agy-telegram/config.toml`:
 
 ```toml
 [telegram]
 bot_token = "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ"
-allowed_users = [123456789] # ID numerico Telegram (da @userinfobot)
+allowed_users = [123456789] # Numeric Telegram user ID (from @userinfobot)
 
 [agent]
 executable = "agy"
@@ -100,69 +100,69 @@ log_file = "/tmp/agy-telegram-chat.log"
 check_interval_seconds = 1.0
 ```
 
-> **Variabili d'ambiente alternative**: È possibile configurare le credenziali tramite `TELEGRAM_BOT_TOKEN` e `TELEGRAM_ALLOWED_USER_ID` in un file `.env` locale o di sistema.
+> **Environment Variables**: Alternatively, configure credentials via `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_ID` in a local `.env` file or environment variables.
 
 ---
 
-## Utilizzo
+## Usage
 
-### 1. Avvia Antigravity in una sessione tmux
+### 1. Launch Antigravity inside tmux
 
 ```bash
 tmux new -s main "agy"
 ```
 
-### 2. Avvia il demone agy-telegram
+### 2. Start the bridge daemon
 
 ```bash
 agy-telegram start
 ```
 
-### 3. Invia messaggi da Telegram
+### 3. Chat via Telegram
 
-Apri la chat del bot su Telegram e invia `/start`. Qualsiasi messaggio inviato in chat verrà inoltrato direttamente nella console attiva di Antigravity.
+Open your bot in Telegram and send `/start`. Plain text messages sent to the chat will be forwarded into the active Antigravity session.
 
 ---
 
-## Comandi Disponibili
+## Bot Commands
 
-| Comando | Descrizione |
+| Command | Description |
 |---|---|
-| `/start` | Mostra lo stato del bridge e la tastiera rapida. |
-| `/status` | Esegue la diagnostica delle risorse host (carico, memoria, disco). |
-| `/model` | Mostra il modello LLM attivo e permette di cambiarlo al volo. |
-| `/usage` | Statistiche sui token consumati, capienza del contesto e passi del turno. |
-| `/autoedit` | Attiva o disattiva l'auto-approvazione delle modifiche ai file (`accept-edits`). |
-| `/mode` | Imposta la modalità operativa (`accept-edits`, `default`, `plan`). |
-| `/new` | Inizializza una nuova sessione azzerando il contesto precedente. |
-| `/sessions` | Elenca le ultime sessioni archiviate per riprenderle. |
-| `/abort` | Invia un segnale di interruzione `Ctrl+C` al terminale. |
-| `/help` | Guida rapida all'uso. |
+| `/start` | Displays status and persistent quick keyboard. |
+| `/status` | Runs host resource diagnostics (load average, memory, disk). |
+| `/model` | Displays the active LLM model and allows switching dynamically. |
+| `/usage` | Reports token usage, context window saturation, and turn steps. |
+| `/autoedit` | Toggles automatic approval for file modifications (`accept-edits`). |
+| `/mode` | Selects execution mode (`accept-edits`, `default`, `plan`). |
+| `/new` | Resets the active session and clears turn context. |
+| `/sessions` | Lists recent conversation IDs for resumption. |
+| `/abort` | Sends `Ctrl+C` interrupt to the active terminal session. |
+| `/help` | Shows operation manual. |
 
-Quando l'agente richiede conferma per un'operazione (ad esempio l'esecuzione di un comando di sistema), compaiono i pulsanti inline **Approva** e **Rifiuta**.
+When the agent prompts for confirmation (e.g. running a shell command), inline buttons (**Approve** and **Reject**) appear directly in the chat.
 
 ---
 
-## Notifiche Push da Script Locali (`agy-notify`)
+## Local Push Alerts (`agy-notify`)
 
-Qualsiasi script bash, job cron o pipeline locale può inviare notifiche push immediate a Telegram senza dipendenze esterne:
+Local scripts, cron jobs, or monitoring hooks can trigger immediate push notifications to Telegram:
 
 ```bash
-# Info
-agy-notify --level info --title "Backup" --message "Backup database completato con successo."
+# Info level
+agy-notify --level info --title "Backup" --message "Database backup completed successfully."
 
-# Warning
-agy-notify --level warning --title "Memoria" --message "Utilizzo RAM superiore all'85%."
+# Warning level
+agy-notify --level warning --title "Memory" --message "RAM usage exceeded 85%."
 
-# Alert critico
-agy-notify --level alert --title "Servizio Offline" --message "Il servizio nginx non risponde."
+# Critical alert
+agy-notify --level alert --title "Service Offline" --message "Nginx process is not responding."
 ```
 
 ---
 
-## Esecuzione con Systemd
+## Running as a Systemd Service
 
-Per eseguire il demone come servizio di sistema in background:
+To deploy `agy-telegram` as a persistent daemon on Linux:
 
 ```bash
 sudo cp systemd/agy-telegram.service /etc/systemd/system/
@@ -171,19 +171,19 @@ sudo systemctl enable --now agy-telegram
 sudo systemctl status agy-telegram
 ```
 
-La unit systemd include direttive di sandboxing di processo (`PrivateTmp=true`, `ProtectSystem=full`, `ProtectHome=read-only`, `RuntimeDirectory=agy-telegram`).
+The systemd unit includes security sandboxing directives (`PrivateTmp=true`, `ProtectSystem=full`, `ProtectHome=read-only`, and `RuntimeDirectory=agy-telegram`).
 
 ---
 
-## Test e Sviluppo
+## Development & Testing
 
-Installazione delle dipendenze di test:
+Install development dependencies:
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-Esecuzione dei test:
+Run test suite:
 
 ```bash
 python3 -m unittest discover tests
@@ -191,6 +191,6 @@ python3 -m unittest discover tests
 
 ---
 
-## Licenza
+## License
 
-Distribuito sotto licenza [MIT](LICENSE).
+Released under the [MIT License](LICENSE).

@@ -46,7 +46,7 @@ class AppConfig(BaseModel):
 
 
 def load_config(config_path: Optional[str] = None) -> AppConfig:
-    """Carica la configurazione da percorsi standard, file .env o variabili d'ambiente."""
+    """Loads configuration from standard paths, .env files, or environment variables."""
     candidate_paths = []
     if config_path:
         candidate_paths.append(Path(config_path))
@@ -76,7 +76,7 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
         allowed_users = [int(u.strip()) for u in allowed_str.split(",") if u.strip().isdigit()]
 
     if not bot_token:
-        # Ricerca file .env standard
+        # Standard .env candidate locations
         env_candidates = [
             Path.cwd() / ".env",
             Path.cwd() / ".env.telegram",
@@ -98,7 +98,7 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
 
     if not bot_token:
         raise ValueError(
-            "Nessun token Telegram trovato! Configura TELEGRAM_BOT_TOKEN o crea un file config.toml."
+            "No Telegram bot token found. Set TELEGRAM_BOT_TOKEN or provide config.toml."
         )
 
     target_session = os.getenv("AGY_TMUX_SESSION", "main:0.0")

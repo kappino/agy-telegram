@@ -2,7 +2,7 @@
 Main Telegram Bot Application wiring all modules together (v2.0 - Production Grade).
 Features:
 - Isolated per-turn state management (TurnContext) to prevent race conditions & orphaned messages
-- Deterministic, solid human-in-the-loop permission buttons (Approva / Rifiuta)
+- Deterministic, solid human-in-the-loop permission buttons (Approve / Reject)
 - /model command to view and switch models dynamically
 - /usage command to monitor context tokens, conversation steps, and quotas
 - /new command to start a clean session
@@ -101,11 +101,11 @@ class AgyTelegramBot:
         self.user_locks: Dict[int, asyncio.Lock] = {}
         self.app: Optional[Application] = None
 
-        # Isolamento di stato per utente / turno
+        # State isolation per user / turn
         self.active_turns: Dict[int, TurnContext] = {}
 
     def get_user_lock(self, user_id: int) -> asyncio.Lock:
-        """Restituisce il lock di serializzazione per un dato utente."""
+        """Returns the serialization lock for a given user."""
         if user_id not in self.user_locks:
             self.user_locks[user_id] = asyncio.Lock()
         return self.user_locks[user_id]
@@ -115,7 +115,7 @@ class AgyTelegramBot:
             return False
         user_id = update.effective_user.id
         if user_id not in self.config.telegram.allowed_users:
-            logger.warning(f"Accesso negato all'utente non autorizzato: {user_id}")
+            logger.warning(f"Access denied to unauthorized user: {user_id}")
             return False
         return True
 
@@ -131,11 +131,11 @@ class AgyTelegramBot:
                     reply_markup=markup,
                 )
             except Exception as e:
-                logger.warning(f"Errore invio HTML ({e}), fallback a plain text.")
+                logger.warning(f"HTML send error ({e}), falling back to plain text.")
                 await update.effective_message.reply_text(chunk, reply_markup=markup)
 
     async def broadcast_to_users(self, text: str, reply_markup=None):
-        """Invia un messaggio a tutti gli utenti autorizzati."""
+        """Sends a message to all authorized users."""
         if not self.app:
             return
         html_text = markdown_to_telegram_html(text)
@@ -158,7 +158,7 @@ class AgyTelegramBot:
                             reply_markup=markup,
                         )
                     except Exception as e:
-                        logger.error(f"Errore broadcast a {user_id}: {e}")
+                        logger.error(f"Broadcast error to {user_id}: {e}")
 
     # -------------------------------------------------------------
     # Command Handlers
@@ -186,16 +186,16 @@ class AgyTelegramBot:
             f"• *Execution Mode:* `{current_exec_mode}`\n"
             f"• *Target Terminal:* `{self.config.mirror.target_session}`\n\n"
             "Quick Commands:\n"
-            "• `/model` - Visualizza e cambia il modello attivo\n"
-            "• `/autoedit` - Attiva/disattiva approvazione automatica file edits\n"
-            "• `/mode` - Seleziona modalità operativa (accept-edits, default, plan)\n"
-            "• `/usage` - Statistiche token contesto e quota rimanente\n"
-            "• `/new` - Inizializza una nuova sessione pulita\n"
-            "• `/sessions` - Elenco e ripristino sessioni recenti\n"
-            "• `/abort` - Invia segnale di interruzione Ctrl+C\n"
-            "• `/status` - Diagnostica risorse host e sistema\n"
-            "• `/help` - Manuale operativo\n\n"
-            "💬 *Tutti i messaggi inviati vengono digitati direttamente nella console attiva!*"
+            "• `/model` - View and switch the active model\n"
+            "• `/autoedit` - Toggle automatic approval for file edits\n"
+            "• `/mode` - Select execution mode (accept-edits, default, plan)\n"
+            "• `/usage` - Context token usage and remaining quota\n"
+            "• `/new` - Reset session with clean context\n"
+            "• `/sessions` - List and resume recent sessions\n"
+            "• `/abort` - Send Ctrl+C interrupt signal\n"
+            "• `/status` - Host and resource diagnostics\n"
+            "• `/help` - Operation manual\n\n"
+            "💬 *Any plain text message will be forwarded directly into the active console.*"
         )
         await self.reply_safe(update, msg, reply_markup=self.get_quick_keyboard())
 
@@ -204,21 +204,21 @@ class AgyTelegramBot:
             return
         msg = (
             "📖 *agy-telegram Operational Manual*\n\n"
-            "🔹 *Messaggi di testo*: Inviati istantaneamente nel prompt della console attiva.\n"
-            "🔹 *Approvazione comandi*: Quando la CLI chiede conferma, compaiono i bottoni ✅ Approva e ❌ Rifiuta.\n"
-            "🔹 `/model`: Visualizza o seleziona il modello LLM (Gemini 3.8/3.6, Claude Sonnet/Opus, ecc.).\n"
-            "🔹 `/autoedit`: Abilita l'approvazione automatica delle modifiche ai file (action edit auto-approved).\n"
-            "🔹 `/mode`: Cambia modalità tra Auto-Edit (`accept-edits`), Standard (`default`) o Planning (`plan`).\n"
-            "🔹 `/usage`: Visualizza il conteggio token usati, la capienza contesto e i token rimasti.\n"
-            "🔹 `/new`: Avvia una nuova sessione azzerando il contesto precedente.\n"
-            "🔹 `/sessions`: Mostra le ultime conversazioni archiviate per riagganciarle.\n"
-            "🔹 `/status`: Esegue la diagnostica risorse host.\n"
-            "🔹 `/abort`: Invia una combinazione di interruzione (`Ctrl+C`) alla sessione terminale."
+            "🔹 *Text messages*: Injected instantly into active console prompt.\n"
+            "🔹 *Command approval*: When the CLI requests confirmation, inline Approve/Reject buttons appear.\n"
+            "🔹 `/model`: View or switch LLM model dynamically.\n"
+            "🔹 `/autoedit`: Toggle auto-approval for file edits (`accept-edits`).\n"
+            "🔹 `/mode`: Switch between Auto-Edit (`accept-edits`), Standard (`default`), or Planning (`plan`).\n"
+            "🔹 `/usage`: View used tokens, remaining context, and step counts.\n"
+            "🔹 `/new`: Start a fresh session clearing previous context.\n"
+            "🔹 `/sessions`: List archived sessions for resumption.\n"
+            "🔹 `/status`: Run host resource diagnostics.\n"
+            "🔹 `/abort`: Send `Ctrl+C` interrupt to active terminal."
         )
         await self.reply_safe(update, msg)
 
     async def cmd_new(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Avvia una nuova sessione pulita."""
+        """Starts a clean session."""
         if not self.is_authorized(update):
             return
 
@@ -241,15 +241,14 @@ class AgyTelegramBot:
             self.session_mgr.set_active_session(None)
 
         msg = (
-            "🆕 <b>Nuova Sessione Inizializzata!</b>\n\n"
-            "La conversazione precedente è stata archiviata.\n"
-            "Il contesto è ora azzerato e pronto per un nuovo task.\n\n"
-            "<i>Puoi inviare la tua nuova istruzione adesso.</i>"
+            "🆕 <b>New Session Initialized</b>\n\n"
+            "Previous context has been archived and reset.\n\n"
+            "<i>You can send your new instruction now.</i>"
         )
         await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def cmd_autoedit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Attiva o disattiva la modalità autoedit (accept-edits) per le modifiche ai file."""
+        """Toggles autoedit (accept-edits) mode for file modifications."""
         if not self.is_authorized(update):
             return
 
@@ -262,21 +261,21 @@ class AgyTelegramBot:
 
         if new_mode == "accept-edits":
             msg = (
-                "✍️ <b>Auto-Edit ABILITATO (accept-edits)!</b>\n\n"
-                "• Tutte le azioni di scrittura e modifica file (<code>replace_file_content</code>, <code>write_to_file</code>) "
-                "saranno <b>approvate automaticamente</b>.\n"
-                "• I comandi shell di sistema richiederanno comunque la tua approvazione manuale (Human-in-the-loop) per sicurezza."
+                "✍️ <b>Auto-Edit ENABLED (accept-edits)</b>\n\n"
+                "• File modifications (<code>replace_file_content</code>, <code>write_to_file</code>) "
+                "will be <b>automatically approved</b>.\n"
+                "• Shell commands still require manual human confirmation."
             )
         else:
             msg = (
-                "🛡️ <b>Modalità Standard Ripristinata (default)</b>\n\n"
-                "• Tutte le azioni (sia modifiche file che comandi shell) richiederanno conferma manuale."
+                "🛡️ <b>Standard Mode Restored (default)</b>\n\n"
+                "• All actions (file modifications and shell commands) require manual approval."
             )
 
         await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
 
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Visualizza e permette di cambiare la modalità operativa (accept-edits, default, plan)."""
+        """Displays and switches execution mode (accept-edits, default, plan)."""
         if not self.is_authorized(update):
             return
 
@@ -287,10 +286,10 @@ class AgyTelegramBot:
                 set_current_mode(target)
                 if self.is_tmux_mode:
                     await self.tmux_mirror.send_input(f"/mode {target}", press_enter=True)
-                await self.reply_safe(update, f"✅ *Modalità impostata su:* `{target}`")
+                await self.reply_safe(update, f"✅ *Mode set to:* `{target}`")
                 return
             else:
-                await self.reply_safe(update, f"⚠️ Modalità non valida `{target}`. Opzioni disponibili: `{', '.join(valid_slugs)}`")
+                await self.reply_safe(update, f"⚠️ Invalid mode `{target}`. Available options: `{', '.join(valid_slugs)}`")
                 return
 
         curr = get_current_mode()
@@ -301,37 +300,37 @@ class AgyTelegramBot:
 
         markup = InlineKeyboardMarkup(buttons)
         text = (
-            "⚙️ <b>Selezione Modalità Esecuzione (Agent Mode)</b>\n\n"
-            f"Modalità attuale: <b>{html.escape(curr)}</b>\n\n"
-            "• <b>Auto-Edit:</b> modifiche file automatiche, conferma solo comandi shell.\n"
-            "• <b>Standard:</b> conferma richiesta sia per file che per comandi.\n"
-            "• <b>Plan Only:</b> sola ricerca e pianificazione senza modifiche.\n\n"
-            "<i>Tocca un'opzione per attivarla:</i>"
+            "⚙️ <b>Select Execution Mode</b>\n\n"
+            f"Current mode: <b>{html.escape(curr)}</b>\n\n"
+            "• <b>Auto-Edit:</b> auto-approve file changes, prompt for shell commands.\n"
+            "• <b>Standard:</b> confirm both file changes and commands.\n"
+            "• <b>Plan Only:</b> read and plan only; no changes executed.\n\n"
+            "<i>Tap an option to switch:</i>"
         )
         await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
     async def cmd_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Mostra le sessioni recenti e consente di riagganciarne una."""
+        """Lists recent sessions and allows resuming them."""
         if not self.is_authorized(update):
             return
 
         sessions = await asyncio.to_thread(self.session_mgr.list_recent_sessions, limit=6)
         if not sessions:
-            await self.reply_safe(update, "ℹ️ Nessuna sessione archiviata trovata nella cronologia.")
+            await self.reply_safe(update, "ℹ️ No archived sessions found.")
             return
 
         buttons = []
         for s in sessions:
             cid = s["id"][:8]
-            prev = s.get("preview") or "Sessione senza titolo"
+            prev = s.get("preview") or "Untitled session"
             dt = s.get("timestamp") or ""
             btn_text = f"🔄 {cid} ({dt}) - {prev[:25]}..."
             buttons.append([InlineKeyboardButton(btn_text, callback_data=f"resume:{s['id']}")])
 
         markup = InlineKeyboardMarkup(buttons)
         text = (
-            "🗂️ <b>Sessioni Recenti Antigravity</b>\n\n"
-            "<i>Tocca una sessione per riprenderla nella console attiva:</i>"
+            "🗂️ <b>Recent Antigravity Sessions</b>\n\n"
+            "<i>Tap a session to resume in the active console:</i>"
         )
         await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
@@ -347,10 +346,10 @@ class AgyTelegramBot:
         if self.is_tmux_mode:
             await self.tmux_mirror.stop_turn_monitoring()
             await self.tmux_mirror.send_raw_key("C-c")
-            await self.reply_safe(update, "🛑 Inviato `Ctrl+C` alla sessione terminale.")
+            await self.reply_safe(update, "🛑 Sent `Ctrl+C` interrupt to terminal.")
         else:
             self.driver.abort_current_task()
-            await self.reply_safe(update, "🛑 Interruzione inviata all'agente.")
+            await self.reply_safe(update, "🛑 Interrupt signal sent to agent.")
 
         if turn_ctx and turn_ctx.status_msg:
             try:
@@ -360,7 +359,7 @@ class AgyTelegramBot:
             turn_ctx.status_msg = None
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Esegue diagnostica di sistema universale o personalizzata in modo sicuro."""
+        """Executes safe universal or custom host diagnostics."""
         if not self.is_authorized(update):
             return
         await update.effective_chat.send_action(ChatAction.TYPING)
@@ -372,11 +371,11 @@ class AgyTelegramBot:
             tokens = shlex.split(custom_cmd.strip())
             bin_name = Path(tokens[0]).name if tokens else ""
             if bin_name not in allowed_status_binaries:
-                logger.warning(f"cmd_status rifiutato: binario '{bin_name}' non è nella allowlist")
+                logger.warning(f"cmd_status rejected: binary '{bin_name}' is not in allowlist")
                 await self.reply_safe(
                     update,
-                    f"⚠️ <b>Comando di status non autorizzato:</b> <code>{html.escape(bin_name)}</code>\n"
-                    f"Binari consentiti: <code>{', '.join(sorted(allowed_status_binaries))}</code>",
+                    f"⚠️ <b>Unauthorized status binary:</b> <code>{html.escape(bin_name)}</code>\n"
+                    f"Allowed binaries: <code>{', '.join(sorted(allowed_status_binaries))}</code>",
                 )
                 return
             proc = await asyncio.create_subprocess_exec(
@@ -385,7 +384,7 @@ class AgyTelegramBot:
                 stderr=asyncio.subprocess.STDOUT,
             )
         else:
-            # Script diagnostico predefinito statico e sicuro
+            # Default static and safe host diagnostic script
             proc = await asyncio.create_subprocess_exec(
                 "sh",
                 "-c",
@@ -399,12 +398,12 @@ class AgyTelegramBot:
             out = stdout.decode("utf-8", errors="replace").strip()
         except asyncio.TimeoutError:
             proc.kill()
-            out = "⚠️ Timeout esecuzione diagnostica (superati 10 secondi)."
+            out = "⚠️ Status command timed out (exceeded 10s)."
 
         await self.reply_safe(update, f"📊 *System Status*\n```text\n{out}\n```")
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Visualizza il modello corrente o lo imposta direttamente se fornito come argomento."""
+        """Displays current model or sets it directly if passed as argument."""
         if not self.is_authorized(update):
             return
 
@@ -420,12 +419,12 @@ class AgyTelegramBot:
 
             if target_model:
                 set_current_model(target_model)
-                await self.reply_safe(update, f"✅ *Modello aggiornato con successo!*\nNuovo modello attivo: `{target_model}`")
+                await self.reply_safe(update, f"✅ *Model updated successfully.*\nActive: `{target_model}`")
                 return
             else:
                 await self.reply_safe(
                     update,
-                    f"⚠️ Modello non trovato per `{query_arg}`.\nUsa `/model` senza argomenti per visualizzare i modelli disponibili.",
+                    f"⚠️ Model not found matching `{query_arg}`.\nUse `/model` without arguments to see available options.",
                 )
                 return
 
@@ -438,14 +437,14 @@ class AgyTelegramBot:
 
         markup = InlineKeyboardMarkup(buttons)
         text = (
-            "🤖 <b>Selezione Modello Antigravity</b>\n\n"
-            f"Modello attualmente attivo:\n<b>{html.escape(current_model)}</b>\n\n"
-            "<i>Tocca un modello per attivarlo istantaneamente:</i>"
+            "🤖 <b>Antigravity Model Selection</b>\n\n"
+            f"Currently active model:\n<b>{html.escape(current_model)}</b>\n\n"
+            "<i>Tap a model to switch dynamically:</i>"
         )
         await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
     async def cmd_usage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Calcola e visualizza i token utilizzati, la capienza del contesto e i token rimasti."""
+        """Reports token usage, context saturation, and turn metrics."""
         if not self.is_authorized(update):
             return
         await update.effective_chat.send_action(ChatAction.TYPING)
@@ -453,7 +452,7 @@ class AgyTelegramBot:
         current_model = get_current_model()
         current_mode = get_current_mode()
         latest_transcript = self.transcript_watcher.get_latest_transcript_path()
-        conv_id = latest_transcript.parent.parent.name if latest_transcript else "N/D"
+        conv_id = latest_transcript.parent.parent.name if latest_transcript else "N/A"
 
         stats = await asyncio.to_thread(compute_session_usage, latest_transcript, current_model)
         msg = format_usage_html(stats, conv_id, current_mode)
@@ -469,36 +468,36 @@ class AgyTelegramBot:
         if not query.data or not update.effective_user:
             return
 
-        # Verifica autorizzazione utente sui callback
+        # Enforce callback authorization
         if not self.is_authorized(update):
-            logger.warning(f"Callback rifiutato da utente non autorizzato: {update.effective_user.id}")
+            logger.warning(f"Callback rejected from unauthorized user: {update.effective_user.id}")
             try:
-                await query.answer("⛔ Accesso non autorizzato.", show_alert=True)
+                await query.answer("⛔ Access denied.", show_alert=True)
             except Exception:
                 pass
             return
 
         user_id = update.effective_user.id
 
-        # 1. Selezione Modello
+        # 1. Model Selection
         if query.data.startswith("set_model:"):
             chosen_model = query.data.split("set_model:", 1)[1]
             success = set_current_model(chosen_model)
             if success:
                 try:
                     await query.edit_message_text(
-                        f"✅ <b>Modello aggiornato con successo!</b>\n"
-                        f"Attivo: <code>{html.escape(chosen_model)}</code>\n\n"
-                        f"<i>Le prossime richieste utilizzeranno questo modello.</i>",
+                        f"✅ <b>Model updated successfully</b>\n"
+                        f"Active: <code>{html.escape(chosen_model)}</code>\n\n"
+                        f"<i>Subsequent prompts will use this model.</i>",
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception:
                     pass
             else:
-                await query.edit_message_text("❌ <i>Errore durante l'aggiornamento del modello.</i>", parse_mode=ParseMode.HTML)
+                await query.edit_message_text("❌ <i>Failed to update model.</i>", parse_mode=ParseMode.HTML)
             return
 
-        # 2. Selezione Modalità (Auto-Edit, Default, Plan)
+        # 2. Mode Selection (Auto-Edit, Default, Plan)
         if query.data.startswith("set_mode:"):
             chosen_mode = query.data.split("set_mode:", 1)[1]
             success = set_current_mode(chosen_mode)
@@ -507,16 +506,16 @@ class AgyTelegramBot:
                     await self.tmux_mirror.send_input(f"/mode {chosen_mode}", press_enter=True)
                 try:
                     await query.edit_message_text(
-                        f"✅ <b>Modalità impostata su:</b> <code>{html.escape(chosen_mode)}</code>",
+                        f"✅ <b>Mode set to:</b> <code>{html.escape(chosen_mode)}</code>",
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception:
                     pass
             else:
-                await query.edit_message_text("❌ <i>Errore durante l'aggiornamento della modalità.</i>", parse_mode=ParseMode.HTML)
+                await query.edit_message_text("❌ <i>Failed to update mode.</i>", parse_mode=ParseMode.HTML)
             return
 
-        # 3. Ripristino Sessione (Resume)
+        # 3. Resume Session
         if query.data.startswith("resume:"):
             conv_id = query.data.split(":", 1)[1]
             if self.is_tmux_mode:
@@ -525,14 +524,14 @@ class AgyTelegramBot:
                 self.session_mgr.set_active_session(conv_id)
             try:
                 await query.edit_message_text(
-                    f"✅ <b>Sessione riagganciata:</b> <code>{html.escape(conv_id)}</code>",
+                    f"✅ <b>Session resumed:</b> <code>{html.escape(conv_id)}</code>",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
                 pass
             return
 
-        # 4. Approvazione / Rifiuto comandi (con validazione rigida del turn_id)
+        # 4. Command Approval / Rejection (with turn_id validation)
         if query.data.startswith("tmux_key:"):
             parts = query.data.split(":")
             key = parts[1]
@@ -540,19 +539,19 @@ class AgyTelegramBot:
 
             turn_ctx = self.active_turns.get(user_id)
 
-            # Prevenzione di replay per comandi di turni precedenti o scaduti
+            # Prevent stale button execution
             if not turn_ctx or (target_turn_id and turn_ctx.turn_id != target_turn_id):
                 try:
                     await query.edit_message_text(
-                        "⏳ <i>Questa richiesta di autorizzazione è scaduta. Il turno non è più attivo.</i>",
+                        "⏳ <i>This permission prompt has expired. Turn is no longer active.</i>",
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception:
-                    await query.answer("⏳ Richiesta scaduta.", show_alert=True)
+                    await query.answer("⏳ Request expired.", show_alert=True)
                 return
 
             if not turn_ctx.is_prompt_active:
-                await query.answer("ℹ️ Nessun comando attualmente in attesa di approvazione.", show_alert=True)
+                await query.answer("ℹ️ No command awaiting confirmation.", show_alert=True)
                 return
 
             turn_ctx.is_prompt_active = False
@@ -560,10 +559,10 @@ class AgyTelegramBot:
             await self.tmux_mirror.send_raw_key(key)
             await self.tmux_mirror.send_raw_key("Enter")
 
-            action_name = "✅ Approvato" if key == "1" else "❌ Rifiutato"
+            action_name = "Approved" if key == "1" else "Rejected"
             try:
                 await query.edit_message_text(
-                    f"⚡ <b>Comando {action_name}</b> (Inviato alla console)\n💭 <i>Elaborazione in corso...</i>",
+                    f"⚡ <b>Command {action_name}</b> (Sent to console)\n💭 <i>Processing...</i>",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
@@ -586,7 +585,7 @@ class AgyTelegramBot:
 
         cleaned_cmd = user_text.strip()
 
-        # Lookup esatto dei comandi da tastiera rapida
+        # Exact lookup for quick keyboard actions
         quick_action_map = {
             "📊 Status": self.cmd_status,
             "📈 Usage": self.cmd_usage,
@@ -605,15 +604,15 @@ class AgyTelegramBot:
 
         self.mirror_log.log("USER", user_text)
 
-        # Serializzazione per-utente per prevenire race conditions su turni sovrapposti
+        # Per-user serialization to prevent race conditions on overlapping turns
         async with self.get_user_lock(user_id):
-            # Pulizia esplicita del turno e cancellazione del watcher precedente
+            # Explicit cleanup of previous turn and orphan watcher cancellation
             prev_turn = self.active_turns.get(user_id)
             if prev_turn and not prev_turn.is_completed:
                 prev_turn.is_completed = True
                 if prev_turn.watcher_task and not prev_turn.watcher_task.done():
                     prev_turn.watcher_task.cancel()
-                    logger.debug(f"Annullato watcher task orfano del turno precedente: {prev_turn.turn_id}")
+                    logger.debug(f"Cancelled orphan watcher task from previous turn: {prev_turn.turn_id}")
                 if prev_turn.status_msg:
                     try:
                         await prev_turn.status_msg.delete()
@@ -628,7 +627,7 @@ class AgyTelegramBot:
             self.active_turns[user_id] = turn_ctx
 
             if self.is_tmux_mode:
-                # Controllo esistenza della sessione Tmux
+                # Check if Tmux session exists
                 if not await self.tmux_mirror.check_session_exists():
                     turn_ctx.is_completed = True
                     if self.active_turns.get(user_id) == turn_ctx:
@@ -636,12 +635,12 @@ class AgyTelegramBot:
                     target = self.tmux_mirror.target
                     sess_name = target.split(":")[0] if ":" in target else target
                     err_msg = (
-                        f"⚠️ <b>Sessione Tmux non trovata!</b>\n\n"
-                        f"Target configurato: <code>{html.escape(target)}</code>\n\n"
-                        f"<b>Come procedere:</b>\n"
-                        f"1. Avvia una sessione tmux sul server con:\n"
+                        f"⚠️ <b>Tmux session not found!</b>\n\n"
+                        f"Configured target: <code>{html.escape(target)}</code>\n\n"
+                        f"<b>How to proceed:</b>\n"
+                        f"1. Start a tmux session on the server with:\n"
                         f"   <code>tmux new -s {html.escape(sess_name)} agy</code>\n"
-                        f"2. Oppure imposta <code>mode = 'driver'</code> nel tuo <code>config.toml</code> per eseguire senza tmux."
+                        f"2. Or set <code>mode = 'driver'</code> in your <code>config.toml</code> to run without tmux."
                     )
                     await update.effective_message.reply_text(err_msg, parse_mode=ParseMode.HTML)
                     return
@@ -655,7 +654,7 @@ class AgyTelegramBot:
                 await self.tmux_mirror.send_input(user_text, press_enter=True)
 
                 status_msg = await update.effective_message.reply_text(
-                    "💭 <b>Elaborazione in corso...</b>",
+                    "💭 <b>Processing...</b>",
                     parse_mode=ParseMode.HTML,
                 )
                 turn_ctx.status_msg = status_msg
@@ -666,7 +665,7 @@ class AgyTelegramBot:
                     nonlocal last_status_edit_time
                     if turn_ctx.is_completed or turn_ctx.is_prompt_active:
                         return
-                    # Throttling a 1.5s per evitare rate limiting HTTP 429 di Telegram
+                    # Throttle to 1.5s to avoid Telegram HTTP 429 rate limiting
                     now = time.monotonic()
                     if now - last_status_edit_time < 1.5:
                         return
@@ -685,14 +684,14 @@ class AgyTelegramBot:
 
                     buttons = [
                         [
-                            InlineKeyboardButton("✅ Approva", callback_data=f"tmux_key:1:{turn_ctx.turn_id}"),
-                            InlineKeyboardButton("❌ Rifiuta", callback_data=f"tmux_key:4:{turn_ctx.turn_id}"),
+                            InlineKeyboardButton("✅ Approve", callback_data=f"tmux_key:1:{turn_ctx.turn_id}"),
+                            InlineKeyboardButton("❌ Reject", callback_data=f"tmux_key:4:{turn_ctx.turn_id}"),
                         ]
                     ]
                     markup = InlineKeyboardMarkup(buttons)
                     clean_cmd = html.escape(cmd_requested)
                     prompt_html = (
-                        "⚠️ <b>Richiesta Autorizzazione Comando</b>\n"
+                        "⚠️ <b>Command Authorization Request</b>\n"
                         f"<pre><code class=\"language-bash\">{clean_cmd}</code></pre>"
                     )
 
@@ -715,7 +714,7 @@ class AgyTelegramBot:
                         )
                         turn_ctx.prompt_msg = new_msg
                     except Exception as ex:
-                        logger.error(f"Errore invio prompt autorizzazione: {ex}")
+                        logger.error(f"Error sending authorization prompt: {ex}")
 
                 async def on_final_response(final_text: str):
                     turn_ctx.is_completed = True
@@ -732,14 +731,14 @@ class AgyTelegramBot:
 
                     self.mirror_log.log("AGY", final_text)
                     await self.reply_safe(update, final_text)
-                    # Rimuovi solo se il turno registrato è ancora questo
+                    # Remove only if current registered turn is still this one
                     if self.active_turns.get(user_id) == turn_ctx:
                         self.active_turns.pop(user_id, None)
 
                 await self.tmux_mirror.start_turn_monitoring(on_prompt=on_turn_prompt)
 
                 if latest_transcript:
-                    # Tracciamento del task con gestione eccezioni
+                    # Task tracking with exception handling
                     watcher_task = asyncio.create_task(
                         self.transcript_watcher.watch_turn(
                             transcript_path=latest_transcript,
@@ -776,13 +775,13 @@ class AgyTelegramBot:
                         stop_typing = True
                         typing_task.cancel()
 
-                        response = stdout if stdout else (stderr or "✅ *(Nessun output)*")
+                        response = stdout if stdout else (stderr or "✅ *(No output)*")
                         self.mirror_log.log("AGY", response)
                         await self.reply_safe(update, response)
                     except Exception as e:
                         stop_typing = True
                         typing_task.cancel()
-                        await self.reply_safe(update, f"⚠️ Errore interno: `{e}`")
+                        await self.reply_safe(update, f"⚠️ Internal error: `{e}`")
                     finally:
                         turn_ctx.is_completed = True
                         if self.active_turns.get(user_id) == turn_ctx:
@@ -793,7 +792,7 @@ class AgyTelegramBot:
     # -------------------------------------------------------------
 
     async def handle_sentinel_alert(self, payload: dict):
-        title = payload.get("title", "Allerta Sentinel")
+        title = payload.get("title", "Sentinel Alert")
         msg = payload.get("message", "")
         lvl = payload.get("level", "info")
 
@@ -802,7 +801,6 @@ class AgyTelegramBot:
             emoji = "⚠️"
         elif lvl == "alert":
             emoji = "🚨"
-
         formatted = f"{emoji} *{title}*\n\n{msg}"
         await self.broadcast_to_users(formatted)
 
@@ -811,7 +809,7 @@ class AgyTelegramBot:
     # -------------------------------------------------------------
 
     async def run(self):
-        logger.info("Inizializzazione agy-telegram bot (v2.0)...")
+        logger.info("Initializing agy-telegram bot (v2.0)...")
         self.app = Application.builder().token(self.config.telegram.bot_token).build()
 
         self.app.add_handler(CommandHandler("start", self.cmd_start))
@@ -835,7 +833,7 @@ class AgyTelegramBot:
         if self.is_tmux_mode:
             await self.tmux_mirror.start_monitor()
 
-        logger.info("Avvio polling Telegram...")
+        logger.info("Starting Telegram polling...")
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling(drop_pending_updates=True)
@@ -844,7 +842,7 @@ class AgyTelegramBot:
             while True:
                 await asyncio.sleep(3600)
         finally:
-            logger.info("Arresto agy-telegram...")
+            logger.info("Stopping agy-telegram...")
             if self.is_tmux_mode:
                 await self.tmux_mirror.stop_monitor()
             await self.sentinel.stop()
