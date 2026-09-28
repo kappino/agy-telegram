@@ -135,53 +135,81 @@ class TmuxMirror:
             "Do you want to run this tool?",
         ]
 
-        # Search backward for the most recent prompt indicator
         prompt_idx = -1
         for idx in range(len(lines) - 1, -1, -1):
             if any(ind in lines[idx] for ind in prompt_indicators):
                 prompt_idx = idx
                 break
 
-        relevant_lines = lines
-        if prompt_idx != -1:
-            start_idx = max(0, prompt_idx - 6)
-            end_idx = min(len(lines), prompt_idx + 8)
-            relevant_lines = lines[start_idx:end_idx]
+        if prompt_idx == -1:
+            raw_context = "\n".join(lines[-10:]).strip()
+            return raw_context or "Unknown prompt", [("1", "Approve"), ("2", "Reject")]
 
-        recent_text = "\n".join(relevant_lines)
+        # Look for "Requesting permission for:" preceding prompt_idx
+        req_idx = -1
+        for idx in range(prompt_idx, -1, -1):
+            if "Requesting permission for:" in lines[idx]:
+                req_idx = idx
+                break
 
-        patterns = [
-            r'Requesting permission for:\s*\n\s*(.*?)(?:\n\s*Run this command|\n\s*\[|\n\s*1\.|\n\s*$)',
-            r'Permission requested?:\s*\n\s*(.*?)(?:\n|$)',
-            r'Run this command\?.*?`([^`]+)`',
-            r'(?:command|execute):\s*`?([^\n`]+)`?',
-        ]
+        # Look for "Run this command?" or "1. Yes" following req_idx
+        run_idx = -1
+        start_search = max(0, req_idx) if req_idx != -1 else 0
+        for idx in range(start_search, len(lines)):
+            if "Run this command?" in lines[idx] or "1. Yes" in lines[idx]:
+                run_idx = idx
+                break
 
         cmd_requested = None
-        for pat in patterns:
-            m = re.search(pat, recent_text, re.DOTALL | re.IGNORECASE)
-            if m and m.group(1).strip():
-                candidate = m.group(1).strip()
-                if not candidate.startswith("1.") and not candidate.startswith("[1]"):
-                    cmd_requested = candidate
+        if req_idx != -1 and run_idx != -1 and run_idx > req_idx:
+            extracted = "\n".join(lines[req_idx + 1:run_idx]).strip()
+            if extracted:
+                cmd_requested = extracted
+
+        # Fallback to regex search on relevant chunk if structured boundaries were not found
+        if not cmd_requested:
+            start_idx = max(0, prompt_idx - 10)
+            end_idx = min(len(lines), prompt_idx + 10)
+            recent_text = "\n".join(lines[start_idx:end_idx])
+
+            patterns = [
+                r'Requesting permission for:\s*\n\s*(.*?)(?:\n\s*Run this command|\n\s*\[|\n\s*1\.|\n\s*$)',
+                r'Permission requested?:\s*\n\s*(.*?)(?:\n|$)',
+                r'Run this command\?.*?`([^`]+)`',
+                r'(?:command|execute):\s*`?([^\n`]+)`?',
+            ]
+
+            for pat in patterns:
+                m = re.search(pat, recent_text, re.DOTALL | re.IGNORECASE)
+                if m and m.group(1).strip():
+                    candidate = m.group(1).strip()
+                    if not candidate.startswith("1.") and not candidate.startswith("[1]"):
+                        cmd_requested = candidate
+                        break
+
+        # Dynamically determine the correct Reject key (2 in 2-option prompts, 4 in 4-option prompts, default 4)
+        reject_key = "4"
+        for line in lines[max(0, prompt_idx - 2):min(len(lines), prompt_idx + 10)]:
+            lower_line = line.lower()
+            if "cancel" in lower_line or "no" in lower_line:
+                if "2." in line:
+                    reject_key = "2"
+                    break
+                elif "4." in line:
+                    reject_key = "4"
                     break
 
         if cmd_requested:
-            # Deterministic, safe interactive options:
-            # Key 1 = Allow once (Approve)
-            # Key 4 = Deny (Reject)
             options = [
                 ("1", "Approve"),
-                ("4", "Reject"),
+                (reject_key, "Reject"),
             ]
             return cmd_requested, options
         else:
-            # Fail-closed: command is ambiguous or unparsed
-            # Return raw terminal block and allow only Reject
-            raw_context = "\n".join(relevant_lines).strip()
+            raw_context = "\n".join(lines[max(0, prompt_idx - 6):min(len(lines), prompt_idx + 8)]).strip()
             raw_desc = raw_context if raw_context else "Unrecognized permission prompt"
             options = [
-                ("4", "Reject"),
+                (reject_key, "Reject"),
             ]
             return raw_desc, options
 
