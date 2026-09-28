@@ -43,7 +43,8 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
     
     candidate_paths.extend([
         Path("/etc/agy-telegram/config.toml"),
-        Path.home() / ".config/agy-telegram/config.toml"),
+        Path.home() / ".config/agy-telegram/config.toml",
+        Path("/opt/aegis-agent/config.toml"),
         Path.cwd() / "config.toml",
     ])
 
