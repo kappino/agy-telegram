@@ -59,6 +59,13 @@ from agy_telegram.core.settings_manager import (
     set_current_mode,
 )
 from agy_telegram.core.usage import compute_session_usage, format_usage_html
+from agy_telegram.core.approval import ApprovalManager, Decision, PendingApproval
+from agy_telegram.core.diff_preview import (
+    generate_diff_for_tool,
+    format_diff_for_telegram,
+    extract_latest_tool_call_from_transcript,
+)
+from agy_telegram.core.media_handler import MediaHandler
 
 logger = logging.getLogger("agy_telegram.bot")
 
@@ -97,12 +104,23 @@ class AgyTelegramBot:
         )
         self.is_tmux_mode = (config.mirror.mode == "tmux")
         self.transcript_watcher = TranscriptWatcher()
+        self.approval_mgr = ApprovalManager(
+            auto_patterns=config.approval.auto_approve_patterns,
+            hard_deny_patterns=config.approval.hard_deny_patterns,
+            timeout_seconds=config.approval.timeout_seconds,
+            fallback_action=config.approval.fallback_action,
+        )
+        self.media_handler = MediaHandler(
+            config=config.media,
+            workspace=Path(config.agent.default_workspace),
+        )
         self.lock = asyncio.Lock()
         self.user_locks: Dict[int, asyncio.Lock] = {}
         self.app: Optional[Application] = None
 
         # State isolation per user / turn
         self.active_turns: Dict[int, TurnContext] = {}
+
 
     def get_user_lock(self, user_id: int) -> asyncio.Lock:
         """Returns the serialization lock for a given user."""
@@ -230,11 +248,13 @@ class AgyTelegramBot:
         user_id = update.effective_user.id
         turn_ctx = self.active_turns.get(user_id)
         if turn_ctx:
+            self.approval_mgr.resolve(turn_ctx.turn_id)
             turn_ctx.is_completed = True
             turn_ctx.is_prompt_active = False
             if turn_ctx.watcher_task and not turn_ctx.watcher_task.done():
                 turn_ctx.watcher_task.cancel()
             if turn_ctx.status_msg:
+
                 try:
                     await turn_ctx.status_msg.delete()
                 except Exception:
@@ -352,11 +372,13 @@ class AgyTelegramBot:
         user_id = update.effective_user.id
         turn_ctx = self.active_turns.get(user_id)
         if turn_ctx:
+            self.approval_mgr.resolve(turn_ctx.turn_id)
             turn_ctx.is_completed = True
             turn_ctx.is_prompt_active = False
             if turn_ctx.watcher_task and not turn_ctx.watcher_task.done():
                 turn_ctx.watcher_task.cancel()
             if turn_ctx.status_msg:
+
                 try:
                     await turn_ctx.status_msg.delete()
                 except Exception:
@@ -570,17 +592,23 @@ class AgyTelegramBot:
             key = parts[1]
             target_turn_id = parts[2] if len(parts) > 2 else None
 
+            # Cancel active timeout timer for this turn
+            if target_turn_id:
+                self.approval_mgr.resolve(target_turn_id)
+
             turn_ctx = self.active_turns.get(user_id)
 
             # Prevent stale button execution
             if not turn_ctx or (target_turn_id and turn_ctx.turn_id != target_turn_id):
+                stale_text = "⏳ <i>This permission prompt has expired. Turn is no longer active.</i>"
                 try:
-                    await query.edit_message_text(
-                        "⏳ <i>This permission prompt has expired. Turn is no longer active.</i>",
-                        parse_mode=ParseMode.HTML,
-                    )
+                    # In python-telegram-bot, edit_message_text is the standard unless explicitly a document/photo message
+                    await query.edit_message_text(stale_text, parse_mode=ParseMode.HTML)
                 except Exception:
-                    pass
+                    try:
+                        await query.edit_message_caption(stale_text, parse_mode=ParseMode.HTML)
+                    except Exception as e:
+                        logger.debug(f"Failed to edit stale message: {e}")
                 await query.answer("⏳ Request expired.", show_alert=True)
                 return
 
@@ -594,14 +622,16 @@ class AgyTelegramBot:
             await self.tmux_mirror.send_raw_key("Enter")
 
             action_name = "Approved" if key == "1" else "Rejected"
+            action_text = f"⚡ <b>Command {action_name}</b> (Sent to console)\n💭 <i>Processing...</i>"
             try:
-                await query.edit_message_text(
-                    f"⚡ <b>Command {action_name}</b> (Sent to console)\n💭 <i>Processing...</i>",
-                    parse_mode=ParseMode.HTML,
-                )
+                await query.edit_message_text(action_text, parse_mode=ParseMode.HTML)
             except Exception:
-                pass
+                try:
+                    await query.edit_message_caption(action_text, parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
             await query.answer(f"Command {action_name}.")
+
 
     # -------------------------------------------------------------
     # Conversational Message Handler
@@ -637,7 +667,35 @@ class AgyTelegramBot:
             await quick_action_map[cleaned_cmd](update, context)
             return
 
-        self.mirror_log.log("USER", user_text)
+        await self._dispatch_turn(update, context, user_text)
+
+    async def handle_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handles incoming photos and documents (screenshots/images) from Telegram."""
+        if not self.is_authorized(update):
+            return
+
+        msg = update.effective_message
+        if not msg:
+            return
+
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        prompt_str, saved_path, err = await self.media_handler.process_media_message(msg)
+        if err:
+            await self.reply_safe(update, f"⚠️ <b>Media Error:</b> {html.escape(err)}", is_html=True)
+            return
+
+        if not prompt_str:
+            return
+
+        logger.info(f"Processed media message successfully, saved at {saved_path}. Dispatching turn.")
+        await self._dispatch_turn(update, context, prompt_str)
+
+    async def _dispatch_turn(self, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_text: str):
+        """Dispatches an interaction turn either via Tmux mirroring or direct AgyDriver."""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        self.mirror_log.log("USER", prompt_text)
 
         # Per-user serialization to prevent race conditions on overlapping turns
         async with self.get_user_lock(user_id):
@@ -654,6 +712,7 @@ class AgyTelegramBot:
             # Explicit cleanup of previous turn and orphan watcher cancellation
             if prev_turn and not prev_turn.is_completed:
                 prev_turn.is_completed = True
+                self.approval_mgr.resolve(prev_turn.turn_id)
                 if prev_turn.watcher_task and not prev_turn.watcher_task.done():
                     prev_turn.watcher_task.cancel()
                     logger.debug(f"Cancelled orphan watcher task from previous turn: {prev_turn.turn_id}")
@@ -698,7 +757,7 @@ class AgyTelegramBot:
                 )
 
                 await update.effective_chat.send_action(ChatAction.TYPING)
-                await self.tmux_mirror.send_input(user_text, press_enter=True)
+                await self.tmux_mirror.send_input(prompt_text, press_enter=True)
 
                 latest_transcript, start_offset = await self.transcript_watcher.await_active_transcript_and_offset(
                     conv_id=active_conv,
@@ -753,8 +812,63 @@ class AgyTelegramBot:
                 async def on_turn_prompt(cmd_requested: str, options: List[Tuple[str, str]]):
                     if turn_ctx.is_completed:
                         return
+
+                    # 1. Smart Approval Evaluation
+                    decision = self.approval_mgr.evaluate(cmd_requested)
+                    clean_cmd = html.escape(cmd_requested)
+
+                    if decision == Decision.AUTO_APPROVE:
+                        logger.info(f"Auto-approving safe diagnostic command: {cmd_requested}")
+                        await self.tmux_mirror.send_raw_key("1")
+                        await self.tmux_mirror.send_raw_key("Enter")
+                        if turn_ctx.status_msg:
+                            try:
+                                await turn_ctx.status_msg.edit_text(
+                                    f"⚡ <b>Auto-Approved Diagnostic Command</b>\n"
+                                    f"<pre><code class=\"language-bash\">{clean_cmd}</code></pre>\n"
+                                    f"💭 <i>Executing automatically...</i>",
+                                    parse_mode=ParseMode.HTML,
+                                )
+                            except Exception:
+                                pass
+                        return
+
+                    if decision == Decision.HARD_DENY:
+                        logger.warning(f"Hard-denying dangerous command by policy: {cmd_requested}")
+                        # Reject key: default '4' or dynamically match from parsed options
+                        reject_key = "4"
+                        for opt_key, opt_label in options:
+                            if "reject" in opt_label.lower() or "deny" in opt_label.lower():
+                                reject_key = opt_key
+                                break
+                        await self.tmux_mirror.send_raw_key(reject_key)
+                        await self.tmux_mirror.send_raw_key("Enter")
+                        if turn_ctx.status_msg:
+                            try:
+                                await turn_ctx.status_msg.edit_text(
+                                    f"🚫 <b>Command Blocked by Security Policy</b>\n"
+                                    f"<pre><code class=\"language-bash\">{clean_cmd}</code></pre>\n"
+                                    f"⚠️ <i>Execution rejected immediately.</i>",
+                                    parse_mode=ParseMode.HTML,
+                                )
+                            except Exception:
+                                pass
+                        return
+
+                    # 2. Decision == Decision.MANUAL: Operator confirmation required
                     turn_ctx.is_prompt_active = True
                     turn_ctx.active_prompt_cmd = cmd_requested
+
+                    # Inspect transcript to synthesize pre-execution unified diff if applicable
+                    diff_text = None
+                    tool_info = extract_latest_tool_call_from_transcript(latest_transcript)
+                    if tool_info:
+                        tool_name, tool_args = tool_info
+                        diff_text = generate_diff_for_tool(
+                            tool_name=tool_name,
+                            args=tool_args,
+                            workspace=Path(self.config.agent.default_workspace),
+                        )
 
                     buttons = [
                         [
@@ -763,36 +877,113 @@ class AgyTelegramBot:
                         ]
                     ]
                     markup = InlineKeyboardMarkup(buttons)
-                    clean_cmd = html.escape(cmd_requested)
+
+                    timeout_sec = self.config.approval.timeout_seconds
                     prompt_html = (
                         "⚠️ <b>Command Authorization Request</b>\n"
-                        f"<pre><code class=\"language-bash\">{clean_cmd}</code></pre>"
+                        f"<pre><code class=\"language-bash\">{clean_cmd}</code></pre>\n"
+                        f"⏱️ <i>Timeout: {timeout_sec}s (Fallback: {self.config.approval.fallback_action})</i>"
                     )
 
-                    if turn_ctx.status_msg:
+                    inline_diff, patch_file = (None, None)
+                    if diff_text:
+                        inline_diff, patch_file = format_diff_for_telegram(diff_text)
+
+                    sent_msg: Optional[Message] = None
+
+                    if patch_file:
+                        # Diff is large (>3000 chars): send as .patch document attachment
+                        if turn_ctx.status_msg:
+                            try:
+                                await turn_ctx.status_msg.delete()
+                                turn_ctx.status_msg = None
+                            except Exception:
+                                pass
                         try:
-                            await turn_ctx.status_msg.edit_text(
-                                prompt_html,
+                            sent_msg = await update.effective_chat.send_document(
+                                document=patch_file,
+                                caption=prompt_html,
                                 parse_mode=ParseMode.HTML,
                                 reply_markup=markup,
                             )
-                            return
-                        except Exception:
-                            pass
+                            turn_ctx.prompt_msg = sent_msg
+                        except Exception as ex:
+                            logger.error(f"Error sending diff patch document: {ex}")
+                    else:
+                        if inline_diff:
+                            prompt_html += f"\n\n<b>Proposed Diff Preview:</b>\n{markdown_to_telegram_html(inline_diff)}"
 
-                    try:
-                        new_msg = await update.effective_chat.send_message(
-                            prompt_html,
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=markup,
+                        if turn_ctx.status_msg:
+                            try:
+                                await turn_ctx.status_msg.edit_text(
+                                    prompt_html,
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=markup,
+                                )
+                                sent_msg = turn_ctx.status_msg
+                            except Exception:
+                                pass
+
+                        if not sent_msg:
+                            try:
+                                sent_msg = await update.effective_chat.send_message(
+                                    prompt_html,
+                                    parse_mode=ParseMode.HTML,
+                                    reply_markup=markup,
+                                )
+                                turn_ctx.prompt_msg = sent_msg
+                            except Exception as ex:
+                                logger.error(f"Error sending authorization prompt: {ex}")
+
+                    # Callback for timeout expiration
+                    async def handle_approval_timeout(pending: PendingApproval, fallback_action: str):
+                        if turn_ctx.is_completed or not turn_ctx.is_prompt_active:
+                            return
+                        turn_ctx.is_prompt_active = False
+
+                        if fallback_action == "abort":
+                            await self.tmux_mirror.send_raw_key("C-c")
+                            action_desc = "Aborted (Ctrl+C)"
+                        else:
+                            # Default fallback is reject
+                            fallback_key = "4"
+                            for opt_key, opt_label in options:
+                                if "reject" in opt_label.lower() or "deny" in opt_label.lower():
+                                    fallback_key = opt_key
+                                    break
+                            await self.tmux_mirror.send_raw_key(fallback_key)
+                            await self.tmux_mirror.send_raw_key("Enter")
+                            action_desc = "Rejected"
+
+                        notice_text = (
+                            f"⏱️ <b>Authorization Timed Out ({timeout_sec}s)</b>\n"
+                            f"<pre><code class=\"language-bash\">{clean_cmd}</code></pre>\n"
+                            f"Action applied: <b>{action_desc}</b>"
                         )
-                        turn_ctx.prompt_msg = new_msg
-                    except Exception as ex:
-                        logger.error(f"Error sending authorization prompt: {ex}")
+                        msg_to_edit = turn_ctx.prompt_msg or turn_ctx.status_msg
+                        if msg_to_edit:
+                            try:
+                                if getattr(msg_to_edit, "document", None) or getattr(msg_to_edit, "caption", None):
+                                    await msg_to_edit.edit_caption(notice_text, parse_mode=ParseMode.HTML)
+                                else:
+                                    await msg_to_edit.edit_text(notice_text, parse_mode=ParseMode.HTML)
+                            except Exception as e:
+                                logger.debug(f"Failed to edit timed out message: {e}")
+
+                    # Arm timeout in ApprovalManager
+                    msg_id = sent_msg.message_id if sent_msg else 0
+                    self.approval_mgr.register_pending(
+                        turn_id=turn_ctx.turn_id,
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        command=cmd_requested,
+                        on_timeout=handle_approval_timeout,
+                    )
 
                 async def on_final_response(final_text: str):
                     turn_ctx.is_completed = True
                     turn_ctx.is_prompt_active = False
+                    self.approval_mgr.resolve(turn_ctx.turn_id)
 
                     await self.tmux_mirror.stop_turn_monitoring()
 
@@ -825,6 +1016,7 @@ class AgyTelegramBot:
                     except asyncio.TimeoutError:
                         if not turn_ctx.is_completed:
                             turn_ctx.is_completed = True
+                            self.approval_mgr.resolve(turn_ctx.turn_id)
                             await self.tmux_mirror.stop_turn_monitoring()
                             if turn_ctx.status_msg:
                                 try:
@@ -842,6 +1034,7 @@ class AgyTelegramBot:
                         logger.error("Critical error in watcher task: %s", exc, exc_info=True)
                         if not turn_ctx.is_completed:
                             turn_ctx.is_completed = True
+                            self.approval_mgr.resolve(turn_ctx.turn_id)
                             await self.tmux_mirror.stop_turn_monitoring()
                             if turn_ctx.status_msg:
                                 try:
@@ -891,6 +1084,7 @@ class AgyTelegramBot:
                         await self.reply_safe(update, f"⚠️ Internal error: `{e}`")
                     finally:
                         turn_ctx.is_completed = True
+                        self.approval_mgr.resolve(turn_ctx.turn_id)
                         if self.active_turns.get(user_id) == turn_ctx:
                             self.active_turns.pop(user_id, None)
 
@@ -935,6 +1129,12 @@ class AgyTelegramBot:
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE,
                 self.handle_message,
+            )
+        )
+        self.app.add_handler(
+            MessageHandler(
+                (filters.PHOTO | (filters.Document.IMAGE & ~filters.COMMAND)) & ~filters.UpdateType.EDITED_MESSAGE,
+                self.handle_media,
             )
         )
 

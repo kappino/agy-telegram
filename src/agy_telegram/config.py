@@ -63,11 +63,35 @@ class MirrorConfig(BaseModel):
     check_interval_seconds: float = 1.0
 
 
+class ApprovalConfig(BaseModel):
+    timeout_seconds: int = 180
+    fallback_action: str = "reject"  # "reject" | "abort"
+    auto_approve_patterns: List[str] = Field(default_factory=lambda: [
+        r"^git\s+(status|diff|log|branch|show)",
+        r"^(cat|head|tail|grep|find|ls|pwd|which|echo)\b",
+        r"^pytest(\s+.*)?$",
+        r"^npm\s+test(\s+.*)?$"
+    ])
+    hard_deny_patterns: List[str] = Field(default_factory=lambda: [
+        r"^rm\s+(-rf|-fr|--recursive)\s+/",
+        r":\(\)\{.*\}\;:",
+        r">\s*/dev/sd[a-z]"
+    ])
+
+
+class MediaConfig(BaseModel):
+    upload_dir: str = ".agy/incoming"
+    max_image_size_mb: int = 10
+
+
 class AppConfig(BaseModel):
     telegram: TelegramConfig
     agent: AgentConfig = Field(default_factory=AgentConfig)
     sentinel: SentinelConfig = Field(default_factory=SentinelConfig)
     mirror: MirrorConfig = Field(default_factory=MirrorConfig)
+    approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
+    media: MediaConfig = Field(default_factory=MediaConfig)
+
 
 
 def load_config(config_path: Optional[str] = None) -> AppConfig:

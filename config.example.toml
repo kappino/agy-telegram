@@ -56,3 +56,30 @@ log_file = "/tmp/agy-telegram-chat.log"
 
 # Status polling interval in seconds
 check_interval_seconds = 1.0
+
+[approval]
+# Timeout in seconds before applying fallback action
+timeout_seconds = 180
+# Fallback action when prompt expires: "reject" (key 4) or "abort" (Ctrl+C)
+fallback_action = "reject"
+
+# Read-only or diagnostic shell command patterns to automatically approve
+auto_approve_patterns = [
+  "^git\\s+(status|diff|log|branch|show)",
+  "^(cat|head|tail|grep|find|ls|pwd|which|echo)\\b",
+  "^pytest(\\s+.*)?$",
+  "^npm\\s+test(\\s+.*)?$"
+]
+
+# Destructive command patterns to block immediately without prompt
+hard_deny_patterns = [
+  "^rm\\s+(-rf|-fr|--recursive)\\s+/",
+  ":\\(\\)\\{.*\\};:",
+  ">\\s*/dev/sd[a-z]"
+]
+
+[media]
+# Relative upload path inside the agent execution workspace
+upload_dir = ".agy/incoming"
+max_image_size_mb = 10
+
