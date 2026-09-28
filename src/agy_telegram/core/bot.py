@@ -690,27 +690,37 @@ class AgyTelegramBot:
                     return
 
                 active_conv = self.session_mgr.get_active_session()
-                latest_transcript = self.transcript_watcher.get_latest_transcript_path(conv_id=active_conv)
-                start_offset = 0
-                if latest_transcript and latest_transcript.is_file():
-                    start_offset = self.transcript_watcher.get_current_offset(latest_transcript)
+                prev_transcript = self.transcript_watcher.get_latest_transcript_path(conv_id=active_conv)
+                prev_offset = (
+                    self.transcript_watcher.get_current_offset(prev_transcript)
+                    if prev_transcript and prev_transcript.is_file()
+                    else 0
+                )
 
                 await update.effective_chat.send_action(ChatAction.TYPING)
                 await self.tmux_mirror.send_input(user_text, press_enter=True)
 
-                if not latest_transcript:
-                    latest_transcript = await self.transcript_watcher.await_latest_transcript(
-                        conv_id=active_conv, timeout=5.0
-                    )
+                latest_transcript, start_offset = await self.transcript_watcher.await_active_transcript_and_offset(
+                    conv_id=active_conv,
+                    prev_transcript_path=prev_transcript,
+                    prev_offset=prev_offset,
+                    timeout=6.0,
+                )
 
-                if not latest_transcript:
+                if latest_transcript:
+                    try:
+                        detected_conv_id = latest_transcript.parent.parent.name
+                        self.session_mgr.set_active_session(detected_conv_id)
+                    except Exception:
+                        pass
+                else:
                     turn_ctx.is_completed = True
                     await self.tmux_mirror.stop_turn_monitoring()
                     if self.active_turns.get(user_id) == turn_ctx:
                         self.active_turns.pop(user_id, None)
                     await update.effective_message.reply_text(
                         "⚠️ <b>Transcript log not found</b>\n\n"
-                        "Unable to locate the active Antigravity session transcript after 5 seconds.\n"
+                        "Unable to locate the active Antigravity session transcript after 6 seconds.\n"
                         "Ensure `agy` is running in your tmux session.",
                         parse_mode=ParseMode.HTML,
                     )

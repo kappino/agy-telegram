@@ -75,6 +75,41 @@ class TranscriptWatcher:
             await asyncio.sleep(0.4)
         return None
 
+    async def await_active_transcript_and_offset(
+        self,
+        conv_id: Optional[str] = None,
+        prev_transcript_path: Optional[Path] = None,
+        prev_offset: int = 0,
+        timeout: float = 6.0,
+    ) -> Tuple[Optional[Path], int]:
+        """
+        Detects either a newly created transcript file (after /new or session rotation)
+        or new data appended to an existing transcript.
+        Returns (transcript_path, start_offset).
+        """
+        if conv_id:
+            target_path = self.get_latest_transcript_path(conv_id=conv_id)
+            if target_path and target_path.is_file():
+                return target_path, prev_offset
+
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < timeout:
+            latest = self.get_latest_transcript_path()
+            if latest and latest.is_file():
+                # Case 1: Brand new transcript session created
+                if prev_transcript_path is None or latest.resolve() != prev_transcript_path.resolve():
+                    return latest, 0
+
+                # Case 2: Existing session grew with the new turn
+                curr_size = self.get_current_offset(latest)
+                if curr_size > prev_offset:
+                    return latest, prev_offset
+
+            await asyncio.sleep(0.2)
+
+        fallback = self.get_latest_transcript_path(conv_id=conv_id) or prev_transcript_path
+        return fallback, prev_offset
+
     def get_current_offset(self, transcript_path: Path) -> int:
         """Returns current file size in bytes for instant O(1) tailing."""
         try:
