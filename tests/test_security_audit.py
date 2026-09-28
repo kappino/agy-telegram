@@ -124,8 +124,11 @@ class TestSecurityAudit(unittest.IsolatedAsyncioTestCase):
         bot.tmux_mirror.check_session_exists = AsyncMock(return_value=True)
         bot.tmux_mirror.send_input = AsyncMock(return_value=True)
         bot.tmux_mirror.start_turn_monitoring = AsyncMock()
+        bot.transcript_watcher.get_latest_transcript_path = MagicMock(return_value=None)
+        bot.transcript_watcher.await_latest_transcript = AsyncMock(return_value=None)
 
         mock_update = MagicMock()
+
         mock_update.effective_user.id = 12345
         mock_update.effective_chat.id = 12345
         mock_update.effective_chat.type = "private"

@@ -678,6 +678,13 @@ class AgyTelegramBot:
 
                 active_conv = self.session_mgr.get_active_session()
                 latest_transcript = self.transcript_watcher.get_latest_transcript_path(conv_id=active_conv)
+                start_offset = 0
+                if latest_transcript and latest_transcript.is_file():
+                    start_offset = self.transcript_watcher.get_current_offset(latest_transcript)
+
+                await update.effective_chat.send_action(ChatAction.TYPING)
+                await self.tmux_mirror.send_input(user_text, press_enter=True)
+
                 if not latest_transcript:
                     latest_transcript = await self.transcript_watcher.await_latest_transcript(
                         conv_id=active_conv, timeout=5.0
@@ -696,18 +703,12 @@ class AgyTelegramBot:
                     )
                     return
 
-                start_offset = 0
-                if latest_transcript and latest_transcript.is_file():
-                    start_offset = self.transcript_watcher.get_current_offset(latest_transcript)
-
-                await update.effective_chat.send_action(ChatAction.TYPING)
-                await self.tmux_mirror.send_input(user_text, press_enter=True)
-
                 status_msg = await update.effective_message.reply_text(
                     "💭 <b>Processing...</b>",
                     parse_mode=ParseMode.HTML,
                 )
                 turn_ctx.status_msg = status_msg
+
 
                 last_status_edit_time = 0.0
 
