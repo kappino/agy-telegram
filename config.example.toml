@@ -41,6 +41,10 @@ enabled = true
 # Path to the UNIX domain socket
 socket_path = "/tmp/agy-sentinel.sock"
 
+# Proactive health & security watchdog for Proxmox and node monitoring
+watchdog_enabled = true
+watchdog_interval_seconds = 300
+
 [mirror]
 # Enable bidirectional terminal bridge with tmux
 enabled = true

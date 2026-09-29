@@ -8,6 +8,7 @@ Monitors the active session's transcript.jsonl in real time without full file re
 
 import asyncio
 import html
+import inspect
 import json
 import logging
 import os
@@ -163,6 +164,7 @@ class TranscriptWatcher:
         active_tasks: Set[str] = set()
         running_tasks_count = 0
         running_subagents = 0
+        modified_files: Set[str] = set()
         pending_final_content: Optional[str] = None
         pending_final_candidate_time: float = 0.0
 
@@ -256,7 +258,9 @@ class TranscriptWatcher:
                                         cmd_preview = cmd_preview[:60] + "..."
                                     detail = f"\n<pre><code>{html.escape(cmd_preview)}</code></pre>"
                                 elif "TargetFile" in args:
-                                    target = Path(args["TargetFile"]).name
+                                    target_fp = str(args["TargetFile"]).strip('\"\'')
+                                    modified_files.add(target_fp)
+                                    target = Path(target_fp).name
                                     detail = f"\n📁 <code>{html.escape(target)}</code>"
                                 elif "AbsolutePath" in args:
                                     target = Path(args["AbsolutePath"]).name
@@ -295,7 +299,11 @@ class TranscriptWatcher:
                     if (time.monotonic() - pending_final_candidate_time) >= debounce_seconds:
                         logger.info(f"Received final response ({len(pending_final_content)} characters).")
                         if on_final:
-                            await on_final(pending_final_content)
+                            sig = inspect.signature(on_final)
+                            if len(sig.parameters) >= 2 or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                                await on_final(pending_final_content, modified_files=list(modified_files))
+                            else:
+                                await on_final(pending_final_content)
                         return
 
         logger.warning(f"watch_turn timed out after {timeout_seconds}s of inactivity on {transcript_path}")

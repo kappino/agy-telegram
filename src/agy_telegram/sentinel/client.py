@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--title", "-t", default="Antigravity Sentinel", help="Notification title")
     parser.add_argument("--message", "-m", required=True, help="Notification message body")
     parser.add_argument("--level", "-l", choices=["info", "warning", "alert"], default="info", help="Severity level")
+    parser.add_argument("--action", "-a", default=None, help="Suggested prompt/action for Aegis investigation")
     parser.add_argument("--socket", "-s", default=default_sock, help="Path to sentinel socket")
 
     args = parser.parse_args()
@@ -25,6 +26,7 @@ def main():
         "title": args.title,
         "message": args.message,
         "level": args.level,
+        "action_prompt": args.action,
     }
 
     try:

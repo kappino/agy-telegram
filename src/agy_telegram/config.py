@@ -53,6 +53,8 @@ class AgentConfig(BaseModel):
 class SentinelConfig(BaseModel):
     enabled: bool = True
     socket_path: str = "/run/agy-telegram/sentinel.sock" if Path("/run/agy-telegram").is_dir() else "/tmp/agy-sentinel.sock"
+    watchdog_enabled: bool = True
+    watchdog_interval_seconds: int = 300
 
 
 class MirrorConfig(BaseModel):

@@ -17,6 +17,7 @@ Features:
 import asyncio
 import html
 import logging
+import os
 import shlex
 import time
 import uuid
@@ -48,6 +49,7 @@ from agy_telegram.core.agy_driver import AgyDriver
 from agy_telegram.core.session import SessionManager
 from agy_telegram.core.tmux_mirror import TmuxMirror
 from agy_telegram.sentinel.server import SentinelServer
+from agy_telegram.sentinel.watchdog import SentinelWatchdog
 from agy_telegram.utils.terminal import TerminalMirror
 from agy_telegram.core.transcript_watcher import TranscriptWatcher
 from agy_telegram.core.settings_manager import (
@@ -121,6 +123,16 @@ class AgyTelegramBot:
         # State isolation per user / turn
         self.active_turns: Dict[int, TurnContext] = {}
 
+        # Cache for 1-tap file downloads and autonomous Sentinel investigation prompts
+        self.file_download_cache: Dict[str, str] = {}
+        self.sentinel_actions: Dict[str, str] = {}
+
+        # Proactive Proxmox & Host Watchdog
+        self.watchdog = SentinelWatchdog(
+            alert_callback=self.handle_sentinel_alert,
+            check_interval=getattr(config.sentinel, "watchdog_interval_seconds", 300),
+        )
+
 
     def get_user_lock(self, user_id: int) -> asyncio.Lock:
         """Returns the serialization lock for a given user."""
@@ -189,12 +201,168 @@ class AgyTelegramBot:
 
     def get_quick_keyboard(self) -> ReplyKeyboardMarkup:
         keyboard = [
-            [KeyboardButton("📊 Status"), KeyboardButton("📈 Usage")],
-            [KeyboardButton("🤖 Model"), KeyboardButton("✍️ Auto-Edit")],
-            [KeyboardButton("🆕 New"), KeyboardButton("🔄 Resume")],
-            [KeyboardButton("🛑 Abort"), KeyboardButton("ℹ️ Help")],
+            [KeyboardButton("📊 Status & Usage"), KeyboardButton("🤖 Modello")],
+            [KeyboardButton("🔄 Resume"), KeyboardButton("📁 File Recenti")],
+            [KeyboardButton("⚙️ Modalità"), KeyboardButton("🛑 Interrompi (C-c)")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+
+    async def cmd_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Displays or resets the persistent quick control panel."""
+        if not self.is_authorized(update):
+            return
+        await update.effective_message.reply_text(
+            "📱 <b>Pannello di Controllo Mobile Attivo</b>\n\n"
+            "<i>Tocca un pulsante in basso per gestire Antigravity con un tocco:</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=self.get_quick_keyboard(),
+        )
+
+    async def _send_file_to_chat(self, chat, file_path_str: str) -> bool:
+        """Sends a file from workspace or filesystem as a Telegram document."""
+        target_path = Path(file_path_str).expanduser()
+        if not target_path.is_absolute():
+            ws_path = Path(self.config.agent.default_workspace)
+            candidate = (ws_path / target_path).resolve()
+            if candidate.is_file():
+                target_path = candidate
+            else:
+                candidate_cwd = (Path.cwd() / target_path).resolve()
+                if candidate_cwd.is_file():
+                    target_path = candidate_cwd
+
+        if not target_path.is_file():
+            await chat.send_message(
+                f"❌ <b>File non trovato:</b> <code>{html.escape(file_path_str)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+
+        size_bytes = target_path.stat().st_size
+        max_bytes = 50 * 1024 * 1024  # 50 MB Telegram bot limit
+        if size_bytes > max_bytes:
+            size_mb = size_bytes / (1024 * 1024)
+            await chat.send_message(
+                f"⚠️ <b>File troppo grande</b> ({size_mb:.1f} MB).\n"
+                f"Il limite massimo di upload per i bot Telegram è 50 MB.",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+
+        if size_bytes < 1024:
+            human_size = f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            human_size = f"{size_bytes / 1024:.1f} KB"
+        else:
+            human_size = f"{size_bytes / (1024 * 1024):.1f} MB"
+
+        await chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        try:
+            with open(target_path, "rb") as f:
+                await chat.send_document(
+                    document=f,
+                    filename=target_path.name,
+                    caption=f"📄 <b>{html.escape(target_path.name)}</b> (<code>{human_size}</code>)",
+                    parse_mode=ParseMode.HTML,
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Error sending document {target_path}: {e}")
+            await chat.send_message(
+                f"❌ <b>Errore durante l'invio del file:</b> {html.escape(str(e))}",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+
+    async def cmd_get(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Retrieves and sends a file from the workspace or filesystem directly to Telegram."""
+        if not self.is_authorized(update):
+            return
+
+        if not context.args or len(context.args) == 0:
+            usage_text = (
+                "📥 <b>Download File</b>\n\n"
+                "• Uso: <code>/get &lt;percorso_file&gt;</code>\n"
+                "• Esempio: <code>/get config.toml</code> o <code>/get src/agy_telegram/config.py</code>\n\n"
+                "<i>Oppure usa il pulsante <b>📁 File Recenti</b> per sfogliare gli ultimi file modificati.</i>"
+            )
+            await update.effective_message.reply_text(usage_text, parse_mode=ParseMode.HTML)
+            return
+
+        raw_path = " ".join(context.args).strip()
+        await self._send_file_to_chat(update.effective_chat, raw_path)
+
+    async def cmd_files(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Lists recently modified files in the workspace and artifacts for 1-tap download."""
+        if not self.is_authorized(update):
+            return
+
+        ws_path = Path(self.config.agent.default_workspace).resolve()
+        ignore_dirs = {".git", "__pycache__", ".venv", ".pytest_cache", ".ruff_cache", "node_modules", ".mypy_cache"}
+
+        candidates = []
+        try:
+            for root, dirs, files in os.walk(ws_path):
+                dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
+                for fname in files:
+                    if fname.endswith((".pyc", ".lock", ".log")):
+                        continue
+                    fp = Path(root) / fname
+                    try:
+                        mtime = fp.stat().st_mtime
+                        candidates.append((mtime, fp))
+                    except Exception:
+                        pass
+        except Exception as ex:
+            logger.debug(f"Error walking workspace files: {ex}")
+
+        incoming_dir = ws_path / self.config.media.upload_dir
+        if incoming_dir.is_dir():
+            for fp in incoming_dir.glob("*.*"):
+                try:
+                    candidates.append((fp.stat().st_mtime, fp))
+                except Exception:
+                    pass
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        recent_files = [fp for _, fp in candidates[:8]]
+
+        if not recent_files:
+            await update.effective_message.reply_text("ℹ️ Nessun file recente trovato nel workspace.")
+            return
+
+        buttons = []
+        for fp in recent_files:
+            size_kb = fp.stat().st_size / 1024
+            btn_id = uuid.uuid4().hex[:6]
+            self.file_download_cache[btn_id] = str(fp)
+            btn_label = f"📥 {fp.name} ({size_kb:.0f} KB)"
+            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"dl_file:{btn_id}")])
+
+        markup = InlineKeyboardMarkup(buttons)
+        msg_text = (
+            "📁 <b>File e Artefatti Recenti:</b>\n"
+            "<i>Tocca un file per scaricarlo subito:</i>"
+        )
+        await update.effective_message.reply_text(msg_text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    async def cmd_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Runs on-demand Proxmox and health watchdog check."""
+        if not self.is_authorized(update):
+            return
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        alerts = await self.watchdog.run_single_check()
+        if not alerts:
+            await update.effective_message.reply_text(
+                "✅ <b>Tutti i sistemi Proxmox e container sono sani e operativi.</b>\n"
+                "Nessuna anomalia o container arrestato rilevato.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=self.get_quick_keyboard(),
+            )
+            return
+
+        for alert in alerts:
+            await self.handle_sentinel_alert(alert)
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_authorized(update):
@@ -209,16 +377,17 @@ class AgyTelegramBot:
             f"• *Execution Mode:* `{current_exec_mode}`\n"
             f"• *Target Terminal:* `{self.config.mirror.target_session}`\n\n"
             "Quick Commands:\n"
-            "• `/model` - View and switch the active model\n"
-            "• `/autoedit` - Toggle automatic approval for file edits\n"
-            "• `/mode` - Select execution mode (accept-edits, default, plan)\n"
-            "• `/usage` - Context token usage and remaining quota\n"
-            "• `/new` - Reset session with clean context\n"
-            "• `/resume` - List and resume conversations by title\n"
-            "• `/abort` - Send Ctrl+C interrupt signal\n"
-            "• `/status` - Host and resource diagnostics\n"
-            "• `/help` - Operation manual\n\n"
-            "💬 *Any plain text message will be forwarded directly into the active console.*"
+            "• `/menu` - Mostra la tastiera comandi rapidi\n"
+            "• `/get <file>` - Scarica qualsiasi file dal server\n"
+            "• `/files` - Elenco file e artefatti recenti da scaricare\n"
+            "• `/check` - Watchdog diagnostico Proxmox & Host\n"
+            "• `/model` - Cambia modello LLM\n"
+            "• `/mode` - Seleziona modalità di esecuzione\n"
+            "• `/usage` - Statistiche consumo token di sessione\n"
+            "• `/resume` - Ripristina sessioni precedenti\n"
+            "• `/abort` - Invia interruzione `Ctrl+C`\n"
+            "• `/help` - Manuale operativo\n\n"
+            "💬 *Qualsiasi messaggio di testo viene inviato direttamente alla console attiva.*"
         )
         await self.reply_safe(update, msg, reply_markup=self.get_quick_keyboard())
 
@@ -226,19 +395,20 @@ class AgyTelegramBot:
         if not self.is_authorized(update):
             return
         msg = (
-            "📖 *agy-telegram Operational Manual*\n\n"
-            "🔹 *Text messages*: Injected instantly into active console prompt.\n"
-            "🔹 *Command approval*: When the CLI requests confirmation, inline Approve/Reject buttons appear.\n"
-            "🔹 `/model`: View or switch LLM model dynamically.\n"
-            "🔹 `/autoedit`: Toggle auto-approval for file edits (`accept-edits`).\n"
-            "🔹 `/mode`: Switch between Auto-Edit (`accept-edits`), Standard (`default`), or Planning (`plan`).\n"
-            "🔹 `/usage`: View used tokens, remaining context, and step counts.\n"
-            "🔹 `/new`: Start a fresh session clearing previous context.\n"
-            "🔹 `/resume`: List previous sessions by title and restore context.\n"
-            "🔹 `/status`: Run host resource diagnostics.\n"
-            "🔹 `/abort`: Send `Ctrl+C` interrupt to active terminal."
+            "📖 *Manuale Operativo agy-telegram*\n\n"
+            "🔹 *Messaggi di testo*: Inoltrati istantaneamente alla console Antigravity.\n"
+            "🔹 *Approvazioni comandi*: Pulsanti interattivi con timeout e anteprima diff pre-esecuzione.\n"
+            "🔹 `/menu`: Mostra la pulsantiera rapida persistente.\n"
+            "🔹 `/get <file>`: Scarica qualsiasi file o report sul telefono.\n"
+            "🔹 `/files`: Sfoglia gli ultimi file modificati con pulsanti di download a un tocco.\n"
+            "🔹 `/check`: Scansione watchdog proattiva di Proxmox, CT e risorse.\n"
+            "🔹 `/model`: Visualizza o cambia il modello LLM.\n"
+            "🔹 `/mode`: Cambia modalità (Auto-Edit, Standard, Plan).\n"
+            "🔹 `/usage`: Statistiche dettagliate sui token consumati.\n"
+            "🔹 `/resume`: Elenco sessioni con anteprima espandibile.\n"
+            "🔹 `/abort`: Invia segnale `Ctrl+C` per interrompere l'agente."
         )
-        await self.reply_safe(update, msg)
+        await self.reply_safe(update, msg, reply_markup=self.get_quick_keyboard())
 
     async def cmd_new(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Starts a clean session."""
@@ -668,6 +838,42 @@ class AgyTelegramBot:
             turn_ctx.status_msg = query.message
             turn_ctx.prompt_msg = None
             await query.answer(f"Command {action_name}.")
+            return
+
+        # 5. File Download button
+        if query.data.startswith("dl_file:"):
+            btn_key = query.data.split("dl_file:", 1)[1]
+            target_path = self.file_download_cache.get(btn_key)
+            if not target_path and Path(btn_key).is_file():
+                target_path = btn_key
+
+            if target_path and Path(target_path).is_file():
+                await query.answer("Invio file in corso...")
+                await self._send_file_to_chat(update.effective_chat, target_path)
+            else:
+                await query.answer("❌ File non trovato o scaduto.", show_alert=True)
+            return
+
+        # 6. Autonomous Sentinel Investigation
+        if query.data.startswith("investigate:"):
+            alert_id = query.data.split("investigate:", 1)[1]
+            prompt = self.sentinel_actions.pop(alert_id, None)
+            if not prompt:
+                await query.answer("⚠️ Azione non più disponibile.", show_alert=True)
+                return
+
+            await query.answer("Indagine avviata.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await update.effective_chat.send_message(
+                f"🚀 <b>Avvio indagine autonoma con Aegis:</b>\n"
+                f"<blockquote>{html.escape(prompt)}</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+            await self._dispatch_turn(update, context, prompt)
+            return
 
 
     # -------------------------------------------------------------
@@ -687,18 +893,30 @@ class AgyTelegramBot:
 
         cleaned_cmd = user_text.strip()
 
-        # Exact lookup for quick keyboard actions
+        # Exact lookup for quick keyboard actions (supports Italian & English)
         quick_action_map = {
+            "📊 Status & Usage": self.cmd_usage,
             "📊 Status": self.cmd_status,
             "📈 Usage": self.cmd_usage,
+            "🤖 Modello": self.cmd_model,
             "🤖 Model": self.cmd_model,
+            "🔄 Resume": self.cmd_resume,
+            "🔄 Resume Sessione": self.cmd_resume,
+            "📁 File Recenti": self.cmd_files,
+            "📁 File": self.cmd_files,
+            "📁 Files": self.cmd_files,
+            "⚙️ Modalità": self.cmd_mode,
+            "⚙️ Mode": self.cmd_mode,
             "✍️ Auto-Edit": self.cmd_autoedit,
             "✍️ Autoedit": self.cmd_autoedit,
             "🆕 New": self.cmd_new,
-            "🔄 Resume": self.cmd_resume,
             "🗂️ Sessions": self.cmd_sessions,
+            "🛑 Interrompi (C-c)": self.cmd_abort,
+            "🛑 Interrompi": self.cmd_abort,
             "🛑 Abort": self.cmd_abort,
             "ℹ️ Help": self.cmd_help,
+            "🔍 Check / Watchdog": self.cmd_check,
+            "🔍 Check": self.cmd_check,
         }
 
         if cleaned_cmd in quick_action_map:
@@ -1053,7 +1271,7 @@ class AgyTelegramBot:
                         on_timeout=handle_approval_timeout,
                     )
 
-                async def on_final_response(final_text: str):
+                async def on_final_response(final_text: str, modified_files: Optional[List[str]] = None):
                     turn_ctx.is_completed = True
                     turn_ctx.is_prompt_active = False
                     self.approval_mgr.resolve(turn_ctx.turn_id)
@@ -1067,8 +1285,22 @@ class AgyTelegramBot:
                             pass
                         turn_ctx.status_msg = None
 
+                    dl_markup = None
+                    if modified_files:
+                        buttons = []
+                        for mf in sorted(set(modified_files)):
+                            mf_path = Path(mf)
+                            if not mf_path.is_absolute():
+                                mf_path = (Path(self.config.agent.default_workspace) / mf_path).resolve()
+                            if mf_path.is_file():
+                                btn_id = uuid.uuid4().hex[:6]
+                                self.file_download_cache[btn_id] = str(mf_path)
+                                buttons.append([InlineKeyboardButton(f"📥 Scarica {mf_path.name}", callback_data=f"dl_file:{btn_id}")])
+                        if buttons:
+                            dl_markup = InlineKeyboardMarkup(buttons)
+
                     self.mirror_log.log("AGY", final_text)
-                    await self.reply_safe(update, final_text)
+                    await self.reply_safe(update, final_text, reply_markup=dl_markup)
                     # Remove only if current registered turn is still this one
                     if self.active_turns.get(user_id) == turn_ctx:
                         self.active_turns.pop(user_id, None)
@@ -1170,14 +1402,26 @@ class AgyTelegramBot:
         title = payload.get("title", "Sentinel Alert")
         msg = payload.get("message", "")
         lvl = payload.get("level", "info")
+        action_prompt = payload.get("action_prompt") or payload.get("suggested_action")
 
         emoji = "ℹ️"
         if lvl == "warning":
             emoji = "⚠️"
         elif lvl == "alert":
             emoji = "🚨"
-        formatted = f"{emoji} *{title}*\n\n{msg}"
-        await self.broadcast_to_users(formatted)
+
+        formatted = f"{emoji} <b>{html.escape(title)}</b>\n\n{html.escape(msg)}"
+        markup = None
+        if action_prompt:
+            formatted += f"\n\n💡 <b>Azione suggerita:</b> <i>{html.escape(action_prompt)}</i>"
+            alert_id = uuid.uuid4().hex[:6]
+            self.sentinel_actions[alert_id] = action_prompt
+            buttons = [
+                [InlineKeyboardButton("🔍 Chiedi ad Aegis di Investigare", callback_data=f"investigate:{alert_id}")]
+            ]
+            markup = InlineKeyboardMarkup(buttons)
+
+        await self.broadcast_to_users(formatted, reply_markup=markup)
 
     # -------------------------------------------------------------
     # Lifecycle
@@ -1189,6 +1433,7 @@ class AgyTelegramBot:
 
         self.app.add_handler(CommandHandler("start", self.cmd_start))
         self.app.add_handler(CommandHandler("help", self.cmd_help))
+        self.app.add_handler(CommandHandler("menu", self.cmd_menu))
         self.app.add_handler(CommandHandler("model", self.cmd_model))
         self.app.add_handler(CommandHandler("usage", self.cmd_usage))
         self.app.add_handler(CommandHandler("new", self.cmd_new))
@@ -1198,6 +1443,11 @@ class AgyTelegramBot:
         self.app.add_handler(CommandHandler("sessions", self.cmd_sessions))
         self.app.add_handler(CommandHandler("abort", self.cmd_abort))
         self.app.add_handler(CommandHandler("status", self.cmd_status))
+        self.app.add_handler(CommandHandler("get", self.cmd_get))
+        self.app.add_handler(CommandHandler("download", self.cmd_get))
+        self.app.add_handler(CommandHandler("files", self.cmd_files))
+        self.app.add_handler(CommandHandler("check", self.cmd_check))
+        self.app.add_handler(CommandHandler("watchdog", self.cmd_check))
 
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
         self.app.add_handler(
@@ -1216,6 +1466,8 @@ class AgyTelegramBot:
         if self.config.sentinel.enabled:
             self.sentinel.register_callback(self.handle_sentinel_alert)
             await self.sentinel.start()
+            if getattr(self.config.sentinel, "watchdog_enabled", True):
+                await self.watchdog.start()
 
         if self.is_tmux_mode:
             await self.tmux_mirror.start_monitor()
@@ -1230,6 +1482,8 @@ class AgyTelegramBot:
                 await asyncio.sleep(3600)
         finally:
             logger.info("Stopping agy-telegram...")
+            if getattr(self.config.sentinel, "watchdog_enabled", True):
+                await self.watchdog.stop()
             if self.is_tmux_mode:
                 await self.tmux_mirror.stop_monitor()
             await self.sentinel.stop()
