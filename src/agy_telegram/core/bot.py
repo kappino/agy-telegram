@@ -590,13 +590,16 @@ class AgyTelegramBot:
                 role, content = last_interaction
                 role_icon = "🤖" if role == "PLANNER_RESPONSE" else "👤"
                 role_label = "Agent" if role == "PLANNER_RESPONSE" else "User"
-                # Preview first 600 chars of last message
-                preview = content.strip()
-                if len(preview) > 600:
-                    preview = preview[:597] + "..."
+
+                formatted_content = markdown_to_telegram_html(content.strip())
+                # Telegram blockquote expandable allows tapping to expand full message
+                # Keep inside safe limits for inline query edit (3200 chars), or fallback if massive
+                if len(formatted_content) > 3200:
+                    formatted_content = formatted_content[:3180] + "..."
+
                 last_msg_notice = (
                     f"\n\n<b>Last interaction ({role_icon} {role_label}):</b>\n"
-                    f"<blockquote>{html.escape(preview)}</blockquote>"
+                    f"<blockquote expandable>{formatted_content}</blockquote>"
                 )
 
             resumed_html = (
@@ -662,6 +665,8 @@ class AgyTelegramBot:
                     await query.edit_message_caption(action_text, parse_mode=ParseMode.HTML)
                 except Exception:
                     pass
+            turn_ctx.status_msg = query.message
+            turn_ctx.prompt_msg = None
             await query.answer(f"Command {action_name}.")
 
 
@@ -839,8 +844,43 @@ class AgyTelegramBot:
                         try:
                             await turn_ctx.status_msg.edit_text(status_text, parse_mode=ParseMode.HTML)
                             last_status_edit_time = now
+                            return
                         except Exception:
                             pass
+                    try:
+                        turn_ctx.status_msg = await update.effective_message.reply_text(
+                            status_text, parse_mode=ParseMode.HTML
+                        )
+                        last_status_edit_time = now
+                    except Exception:
+                        pass
+
+                async def on_interim_response(interim_text: str):
+                    if turn_ctx.is_completed or turn_ctx.is_prompt_active:
+                        return
+                    clean_text = interim_text.strip()
+                    if not clean_text:
+                        return
+                    formatted = markdown_to_telegram_html(clean_text)
+                    if len(formatted) > 3000:
+                        formatted = formatted[:2980] + "..."
+                    status_body = (
+                        f"💬 <b>Agent:</b>\n"
+                        f"<blockquote expandable>{formatted}</blockquote>\n\n"
+                        f"⏳ <i>Background task in progress...</i>"
+                    )
+                    if turn_ctx.status_msg:
+                        try:
+                            await turn_ctx.status_msg.edit_text(status_body, parse_mode=ParseMode.HTML)
+                            return
+                        except Exception:
+                            pass
+                    try:
+                        turn_ctx.status_msg = await update.effective_message.reply_text(
+                            status_body, parse_mode=ParseMode.HTML
+                        )
+                    except Exception as e:
+                        logger.debug(f"Failed to send interim response: {e}")
 
                 async def on_turn_prompt(cmd_requested: str, options: List[Tuple[str, str]]):
                     if turn_ctx.is_completed:
@@ -868,10 +908,10 @@ class AgyTelegramBot:
 
                     if decision == Decision.HARD_DENY:
                         logger.warning(f"Hard-denying dangerous command by policy: {cmd_requested}")
-                        # Reject key: default '4' or dynamically match from parsed options
-                        reject_key = "4"
+                        # Reject key: default from second option or dynamically match from parsed options
+                        reject_key = options[1][0] if len(options) > 1 else "2"
                         for opt_key, opt_label in options:
-                            if "reject" in opt_label.lower() or "deny" in opt_label.lower():
+                            if any(w in opt_label.lower() for w in ("reject", "deny", "cancel", "no")):
                                 reject_key = opt_key
                                 break
                         await self.tmux_mirror.send_raw_key(reject_key)
@@ -979,9 +1019,9 @@ class AgyTelegramBot:
                             action_desc = "Aborted (Ctrl+C)"
                         else:
                             # Default fallback is reject
-                            fallback_key = "4"
+                            fallback_key = options[1][0] if len(options) > 1 else "2"
                             for opt_key, opt_label in options:
-                                if "reject" in opt_label.lower() or "deny" in opt_label.lower():
+                                if any(w in opt_label.lower() for w in ("reject", "deny", "cancel", "no")):
                                     fallback_key = opt_key
                                     break
                             await self.tmux_mirror.send_raw_key(fallback_key)
@@ -1042,6 +1082,7 @@ class AgyTelegramBot:
                             start_offset=start_offset,
                             on_status=on_status_update,
                             on_final=on_final_response,
+                            on_interim=on_interim_response,
                             timeout_seconds=self.config.agent.timeout_seconds,
                         )
                     except asyncio.CancelledError:

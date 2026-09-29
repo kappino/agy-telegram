@@ -92,6 +92,86 @@ class TestTranscriptWatcher(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(finals), 1, "Exactly one final response must be emitted")
         self.assertEqual(finals[0], "Operation completed successfully!")
 
+    async def test_watch_turn_with_background_task_and_interim_response(self):
+        """Verify that background tasks and interim messages do NOT prematurely end turn."""
+        statuses = []
+        interims = []
+        finals = []
+
+        async def dummy_on_status(status_text: str):
+            statuses.append(status_text)
+
+        async def dummy_on_interim(interim_text: str):
+            interims.append(interim_text)
+
+        async def dummy_on_final(final_text: str):
+            finals.append(final_text)
+
+        self.transcript_file.write_text("", encoding="utf-8")
+
+        watch_task = asyncio.create_task(
+            self.watcher.watch_turn(
+                transcript_path=self.transcript_file,
+                start_offset=0,
+                on_status=dummy_on_status,
+                on_interim=dummy_on_interim,
+                on_final=dummy_on_final,
+                timeout_seconds=5,
+            )
+        )
+
+        await asyncio.sleep(0.1)
+
+        # Step 1: Background task started
+        step1 = json.dumps({
+            "type": "GENERIC",
+            "status": "RUNNING",
+            "content": "Tool is running as a background task with task id: test-conv/task-100\nTask Description: sleep 1",
+        }) + "\n"
+        with open(self.transcript_file, "a", encoding="utf-8") as f:
+            f.write(step1)
+
+        await asyncio.sleep(0.4)
+
+        # Step 2: Interim model response while task is running
+        step2 = json.dumps({
+            "type": "PLANNER_RESPONSE",
+            "content": "Task is running in background. Waiting for results...",
+        }) + "\n"
+        with open(self.transcript_file, "a", encoding="utf-8") as f:
+            f.write(step2)
+
+        await asyncio.sleep(0.4)
+
+        # Watcher must NOT have emitted final response yet!
+        self.assertEqual(len(finals), 0, "Watcher must NOT terminate on interim message while task is running!")
+        self.assertEqual(len(interims), 1, "Interim message must be forwarded via on_interim!")
+        self.assertEqual(interims[0], "Task is running in background. Waiting for results...")
+
+        # Step 3: Background task completes
+        step3 = json.dumps({
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "content": 'Task id "test-conv/task-100" finished with result:\nDone output',
+        }) + "\n"
+        with open(self.transcript_file, "a", encoding="utf-8") as f:
+            f.write(step3)
+
+        await asyncio.sleep(0.4)
+
+        # Step 4: True final response
+        step4 = json.dumps({
+            "type": "PLANNER_RESPONSE",
+            "content": "All background tasks completed. Here is the final answer.",
+        }) + "\n"
+        with open(self.transcript_file, "a", encoding="utf-8") as f:
+            f.write(step4)
+
+        await asyncio.wait_for(watch_task, timeout=2.5)
+
+        self.assertEqual(len(finals), 1, "Exactly one final response must be emitted")
+        self.assertEqual(finals[0], "All background tasks completed. Here is the final answer.")
+
 
 if __name__ == "__main__":
     unittest.main()

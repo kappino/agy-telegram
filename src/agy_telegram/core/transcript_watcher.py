@@ -11,9 +11,10 @@ import html
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
-from typing import Optional, Callable, Coroutine, Any, Dict, List, Tuple
+from typing import Optional, Callable, Coroutine, Any, Dict, List, Tuple, Set
 
 from agy_telegram.config import get_antigravity_home
 
@@ -124,11 +125,14 @@ class TranscriptWatcher:
         start_offset: Optional[int] = None,
         on_status: Optional[Callable[[str], Coroutine[Any, Any, None]]] = None,
         on_final: Optional[Callable[[str], Coroutine[Any, Any, None]]] = None,
+        on_interim: Optional[Callable[[str], Coroutine[Any, Any, None]]] = None,
         timeout_seconds: int = 300,
     ):
         """
         Streams transcript in real-time from a byte offset O(1).
-        Emits status updates for reasoning and tool invocations, returning final response.
+        Emits status updates for reasoning, tool invocations, and interim messages.
+        Accurately detects turn completion without terminating prematurely during
+        background/async task execution.
         Raises TimeoutError if timeout_seconds is exceeded without turn completion.
         """
         current_offset = 0
@@ -152,10 +156,17 @@ class TranscriptWatcher:
 
         last_status_sent = ""
         pending_buffer = ""
-        start_time = time.monotonic()
-        poll_interval = 0.3
+        last_activity_time = time.monotonic()
+        poll_interval = 0.25
+        debounce_seconds = 0.6
 
-        while (time.monotonic() - start_time) < timeout_seconds:
+        active_tasks: Set[str] = set()
+        running_tasks_count = 0
+        running_subagents = 0
+        pending_final_content: Optional[str] = None
+        pending_final_candidate_time: float = 0.0
+
+        while (time.monotonic() - last_activity_time) < timeout_seconds:
             await asyncio.sleep(poll_interval)
 
             if not transcript_path.is_file():
@@ -165,73 +176,127 @@ class TranscriptWatcher:
                 _read_transcript_delta, transcript_path, current_offset
             )
 
-            if not chunk:
-                continue
+            if chunk:
+                last_activity_time = time.monotonic()
+                pending_buffer += chunk
+                raw_lines = pending_buffer.split("\n")
+                # Last element may be an incomplete line
+                pending_buffer = raw_lines.pop()
 
-            pending_buffer += chunk
-            raw_lines = pending_buffer.split("\n")
-            # Last element may be an incomplete line
-            pending_buffer = raw_lines.pop()
+                for line in raw_lines:
+                    clean_line = line.strip()
+                    if not clean_line:
+                        continue
 
-            for line in raw_lines:
-                clean_line = line.strip()
-                if not clean_line:
-                    continue
+                    try:
+                        record = json.loads(clean_line)
+                    except Exception:
+                        continue
 
-                try:
-                    record = json.loads(clean_line)
-                except Exception:
-                    continue
+                    rec_type = record.get("type")
+                    rec_status = record.get("status")
+                    content = record.get("content")
+                    tool_calls = record.get("tool_calls")
+                    thinking = record.get("thinking")
 
-                rec_type = record.get("type")
-                content = record.get("content")
-                tool_calls = record.get("tool_calls")
-                thinking = record.get("thinking")
+                    # 1. Track background task lifecycle from GENERIC records
+                    if rec_type == "GENERIC":
+                        content_str = str(content or "")
+                        if rec_status == "RUNNING" or ("background task" in content_str.lower() and "task id:" in content_str.lower()):
+                            m = re.search(r'task id:?\s*["\']?([^"\'\s\n]+)', content_str, re.IGNORECASE)
+                            if m:
+                                task_id = m.group(1).strip()
+                                active_tasks.add(task_id)
+                                logger.info(f"Background task started: {task_id} (active: {len(active_tasks)})")
+                            else:
+                                running_tasks_count += 1
+                        elif rec_status == "DONE":
+                            m = re.search(r'Task id\s*["\']?([^"\'\s\n]+)["\']?\s*finished', content_str, re.IGNORECASE)
+                            if m:
+                                active_tasks.discard(m.group(1).strip())
 
-                if rec_type == "PLANNER_RESPONSE":
-                    # 1. In-progress Tool Action
-                    if tool_calls:
-                        for tc in tool_calls:
-                            name = tc.get("name", "tool")
-                            args = tc.get("args", {})
-                            if isinstance(args, str):
-                                try:
-                                    args = json.loads(args)
-                                except Exception:
-                                    args = {}
-                            action = html.escape(str(args.get("toolAction") or args.get("toolSummary") or name))
+                    # 2. Track background task / subagent completion from SYSTEM_MESSAGE
+                    elif rec_type == "SYSTEM_MESSAGE":
+                        content_str = str(content or "")
+                        m = re.search(r'Task id\s*["\']?([^"\'\s\n]+)["\']?\s*finished', content_str, re.IGNORECASE)
+                        if not m:
+                            m = re.search(r'sender=([^\s\n]+).*finished', content_str, re.IGNORECASE)
+                        if m:
+                            task_id = m.group(1).strip()
+                            active_tasks.discard(task_id)
+                            logger.info(f"Background task completed: {task_id} (remaining active: {len(active_tasks)})")
+                        elif "finished with result" in content_str.lower() or "completed" in content_str.lower():
+                            if running_tasks_count > 0:
+                                running_tasks_count -= 1
 
-                            detail = ""
-                            if "CommandLine" in args:
-                                cmd_preview = str(args["CommandLine"]).strip()
-                                if len(cmd_preview) > 60:
-                                    cmd_preview = cmd_preview[:60] + "..."
-                                detail = f"\n<pre><code>{html.escape(cmd_preview)}</code></pre>"
-                            elif "TargetFile" in args:
-                                target = Path(args["TargetFile"]).name
-                                detail = f"\n📁 <code>{html.escape(target)}</code>"
-                            elif "AbsolutePath" in args:
-                                target = Path(args["AbsolutePath"]).name
-                                detail = f"\n📄 <code>{html.escape(target)}</code>"
+                        if "subagent" in content_str.lower() and running_subagents > 0:
+                            running_subagents -= 1
 
-                            status_text = f"⚡ <b>Action:</b> {action}{detail}"
+                    # 3. Model Responses
+                    elif rec_type == "PLANNER_RESPONSE":
+                        # A. In-progress Tool Action
+                        if tool_calls:
+                            pending_final_content = None
+                            for tc in tool_calls:
+                                name = tc.get("name", "tool")
+                                if name == "invoke_subagent":
+                                    running_subagents += 1
+                                args = tc.get("args", {})
+                                if isinstance(args, str):
+                                    try:
+                                        args = json.loads(args)
+                                    except Exception:
+                                        args = {}
+                                action = html.escape(str(args.get("toolAction") or args.get("toolSummary") or name))
+
+                                detail = ""
+                                if "CommandLine" in args:
+                                    cmd_preview = str(args["CommandLine"]).strip()
+                                    if len(cmd_preview) > 60:
+                                        cmd_preview = cmd_preview[:60] + "..."
+                                    detail = f"\n<pre><code>{html.escape(cmd_preview)}</code></pre>"
+                                elif "TargetFile" in args:
+                                    target = Path(args["TargetFile"]).name
+                                    detail = f"\n📁 <code>{html.escape(target)}</code>"
+                                elif "AbsolutePath" in args:
+                                    target = Path(args["AbsolutePath"]).name
+                                    detail = f"\n📄 <code>{html.escape(target)}</code>"
+
+                                status_text = f"⚡ <b>Action:</b> {action}{detail}"
+                                if status_text != last_status_sent and on_status:
+                                    last_status_sent = status_text
+                                    await on_status(status_text)
+
+                        # B. Reasoning Phase
+                        elif thinking and not content:
+                            pending_final_content = None
+                            status_text = "🧠 <b>Thinking...</b>"
                             if status_text != last_status_sent and on_status:
                                 last_status_sent = status_text
                                 await on_status(status_text)
 
-                    # 2. Reasoning Phase
-                    elif thinking and not content:
-                        status_text = "🧠 <b>Thinking...</b>"
-                        if status_text != last_status_sent and on_status:
-                            last_status_sent = status_text
-                            await on_status(status_text)
-
-                    # 3. Final Response (only when no concurrent tool calls exist)
-                    elif content and not tool_calls:
-                        logger.info(f"Received final response ({len(content)} characters).")
+                        # C. Text Response: Check if Interim or Final Candidate
+                        elif content and not tool_calls:
+                            has_async = (len(active_tasks) > 0 or running_tasks_count > 0 or running_subagents > 0)
+                            if has_async:
+                                logger.info(f"Received interim response ({len(content)} characters) while async tasks running.")
+                                pending_final_content = None
+                                if on_interim:
+                                    await on_interim(content)
+                                elif on_status:
+                                    await on_status(f"💬 <i>{html.escape(content[:250])}</i>\n\n⏳ <i>Background task in progress...</i>")
+                            else:
+                                pending_final_content = content
+                                pending_final_candidate_time = time.monotonic()
+            else:
+                # No new chunk in this tick: evaluate settled final candidate
+                has_async = (len(active_tasks) > 0 or running_tasks_count > 0 or running_subagents > 0)
+                if pending_final_content is not None and not has_async:
+                    if (time.monotonic() - pending_final_candidate_time) >= debounce_seconds:
+                        logger.info(f"Received final response ({len(pending_final_content)} characters).")
                         if on_final:
-                            await on_final(content)
+                            await on_final(pending_final_content)
                         return
 
-        logger.warning(f"watch_turn timed out after {timeout_seconds}s on {transcript_path}")
-        raise asyncio.TimeoutError(f"Task execution timed out after {timeout_seconds} seconds.")
+        logger.warning(f"watch_turn timed out after {timeout_seconds}s of inactivity on {transcript_path}")
+        raise asyncio.TimeoutError(f"Task execution timed out after {timeout_seconds} seconds of inactivity.")
