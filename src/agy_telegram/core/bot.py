@@ -191,8 +191,8 @@ class AgyTelegramBot:
         keyboard = [
             [KeyboardButton("📊 Status"), KeyboardButton("📈 Usage")],
             [KeyboardButton("🤖 Model"), KeyboardButton("✍️ Auto-Edit")],
-            [KeyboardButton("🆕 New"), KeyboardButton("🛑 Abort")],
-            [KeyboardButton("ℹ️ Help")],
+            [KeyboardButton("🆕 New"), KeyboardButton("🔄 Resume")],
+            [KeyboardButton("🛑 Abort"), KeyboardButton("ℹ️ Help")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
@@ -214,7 +214,7 @@ class AgyTelegramBot:
             "• `/mode` - Select execution mode (accept-edits, default, plan)\n"
             "• `/usage` - Context token usage and remaining quota\n"
             "• `/new` - Reset session with clean context\n"
-            "• `/sessions` - List and resume recent sessions\n"
+            "• `/resume` - List and resume conversations by title\n"
             "• `/abort` - Send Ctrl+C interrupt signal\n"
             "• `/status` - Host and resource diagnostics\n"
             "• `/help` - Operation manual\n\n"
@@ -234,7 +234,7 @@ class AgyTelegramBot:
             "🔹 `/mode`: Switch between Auto-Edit (`accept-edits`), Standard (`default`), or Planning (`plan`).\n"
             "🔹 `/usage`: View used tokens, remaining context, and step counts.\n"
             "🔹 `/new`: Start a fresh session clearing previous context.\n"
-            "🔹 `/sessions`: List archived sessions for resumption.\n"
+            "🔹 `/resume`: List previous sessions by title and restore context.\n"
             "🔹 `/status`: Run host resource diagnostics.\n"
             "🔹 `/abort`: Send `Ctrl+C` interrupt to active terminal."
         )
@@ -341,8 +341,8 @@ class AgyTelegramBot:
         )
         await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
-    async def cmd_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Lists recent sessions and allows resuming them."""
+    async def cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Lists recent sessions by title and allows resuming them (like the CLI /resume)."""
         if not self.is_authorized(update):
             return
 
@@ -353,18 +353,24 @@ class AgyTelegramBot:
 
         buttons = []
         for s in sessions:
-            cid = s["id"][:8]
-            prev = s.get("preview") or "Untitled session"
+            title_text = s.get("display_title") or s.get("title") or s.get("preview") or "Untitled session"
+            if len(title_text) > 38:
+                title_text = title_text[:35] + "..."
             dt = s.get("timestamp") or ""
-            btn_text = f"🔄 {cid} ({dt}) - {prev[:25]}..."
+            dt_badge = f" ({dt[-5:]})" if len(dt) >= 5 else ""
+            btn_text = f"💬 {title_text}{dt_badge}"
             buttons.append([InlineKeyboardButton(btn_text, callback_data=f"resume:{s['id']}")])
 
         markup = InlineKeyboardMarkup(buttons)
         text = (
-            "🗂️ <b>Recent Antigravity Sessions</b>\n\n"
-            "<i>Tap a session to resume in the active console:</i>"
+            "🔄 <b>Resume Antigravity Session</b>\n\n"
+            "<i>Select a previous conversation to restore context:</i>"
         )
         await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    async def cmd_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Alias for /resume."""
+        await self.cmd_resume(update, context)
 
     async def cmd_abort(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_authorized(update):
@@ -576,13 +582,39 @@ class AgyTelegramBot:
             self.session_mgr.set_active_session(conv_id)
             if self.is_tmux_mode:
                 await self.tmux_mirror.send_input(f"/resume {conv_id}", press_enter=True)
+
+            # Retrieve last message from transcript
+            last_interaction = await asyncio.to_thread(self.session_mgr.get_last_interaction, conv_id)
+            last_msg_notice = ""
+            if last_interaction:
+                role, content = last_interaction
+                role_icon = "🤖" if role == "PLANNER_RESPONSE" else "👤"
+                role_label = "Agent" if role == "PLANNER_RESPONSE" else "User"
+                # Preview first 600 chars of last message
+                preview = content.strip()
+                if len(preview) > 600:
+                    preview = preview[:597] + "..."
+                last_msg_notice = (
+                    f"\n\n<b>Last interaction ({role_icon} {role_label}):</b>\n"
+                    f"<blockquote>{html.escape(preview)}</blockquote>"
+                )
+
+            resumed_html = (
+                f"✅ <b>Session resumed:</b> <code>{html.escape(conv_id)}</code>"
+                f"{last_msg_notice}\n\n"
+                f"<i>Ready for new instructions.</i>"
+            )
+
             try:
                 await query.edit_message_text(
-                    f"✅ <b>Session resumed:</b> <code>{html.escape(conv_id)}</code>",
+                    resumed_html,
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
-                pass
+                try:
+                    await query.message.reply_text(resumed_html, parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
             await query.answer("Session resumed.")
             return
 
@@ -658,6 +690,7 @@ class AgyTelegramBot:
             "✍️ Auto-Edit": self.cmd_autoedit,
             "✍️ Autoedit": self.cmd_autoedit,
             "🆕 New": self.cmd_new,
+            "🔄 Resume": self.cmd_resume,
             "🗂️ Sessions": self.cmd_sessions,
             "🛑 Abort": self.cmd_abort,
             "ℹ️ Help": self.cmd_help,
@@ -1120,6 +1153,7 @@ class AgyTelegramBot:
         self.app.add_handler(CommandHandler("new", self.cmd_new))
         self.app.add_handler(CommandHandler("autoedit", self.cmd_autoedit))
         self.app.add_handler(CommandHandler("mode", self.cmd_mode))
+        self.app.add_handler(CommandHandler("resume", self.cmd_resume))
         self.app.add_handler(CommandHandler("sessions", self.cmd_sessions))
         self.app.add_handler(CommandHandler("abort", self.cmd_abort))
         self.app.add_handler(CommandHandler("status", self.cmd_status))
